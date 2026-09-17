@@ -11,7 +11,7 @@ own LLM and voice.
 - **Private by design.** Faces render on the device. The SDK sends Yoob only what is listed under [Network](#network):
   conversation audio goes through Yoob only when you use Yoob voice.
 
-Requires iOS 17 or later and Xcode 16 or later. The current preview release is 0.4.0; see [Changes in 0.4.0](#changes-in-040) if you are upgrading.
+Requires iOS 17 or later and Xcode 16 or later. The current preview release is 0.4.1; see [Changes in 0.4.1](#changes-in-041) and [0.4.0](#changes-in-040) if you are upgrading.
 
 ## Install
 
@@ -281,12 +281,26 @@ and an update downloads only the files that changed.
 | `.stopped(error)` | The session ended and the character stopped rendering. See below. |
 
 The session stops when the workspace is out of credit (`.outOfCredit`), when Yoob refuses the session or its API key
-was revoked (`.unauthorized`), or with `.sessionEnded` after three heartbeats in a row fail, when a sandbox session
-reaches its time limit, or when the workspace is suspended. The avatar then stops rendering,
-`speak` throws the same error, and `avatar.onSessionEnded` is called. `prepare()` opens a new session.
+was revoked (`.unauthorized`), or with `.sessionEnded` when a sandbox session reaches its time limit, when the
+workspace is suspended, or when Yoob can't be reached for the whole outage grace window
+(`.sessionEnded("unreachable")`). The avatar then stops rendering, `speak` throws the same error, and
+`avatar.onSessionEnded` is called. `prepare()` opens a new session.
 
 ```swift
 avatar.onSessionEnded = { error in showBanner(error.localizedDescription) }
+```
+
+If heartbeats get no answer (network errors, timeouts, 408, 429, 5xx), the character keeps rendering while the SDK
+retries (after 2 s, 6 s, then every 15 s). `avatar.isHeartbeatDegraded` becomes true and `avatar.onHeartbeatDegraded`
+is called; `avatar.onHeartbeatRecovered` is called when a heartbeat succeeds again. The character stops only once
+`heartbeatOutageGraceSeconds` (default 600, clamped to 0...1800) have passed since the last successful heartbeat. Pass
+0 to stop at the first failure:
+
+```swift
+let avatar = YoobAvatar(.cloud(character: "luna-anime") { try await MyBackend.yoobSession() },
+                        heartbeatOutageGraceSeconds: 300)
+avatar.onHeartbeatDegraded = { detail in showOfflineHint() }
+avatar.onHeartbeatRecovered = { hideOfflineHint() }
 ```
 
 `avatar.stats` counts frames shown and skipped. `avatar.lastRendererError` says why rendering stopped, if it did.
@@ -358,10 +372,15 @@ machine. Before you deploy a token server, replace `requireUser()` with your own
 - **Grants are short-lived and per character.** A download grant covers the characters its session was opened for and
   expires soon. Heartbeats may hand the SDK a renewed grant, which it uses from the next download request on. A voice
   token opens one conversation and must be used within 5 minutes.
-- **Heartbeats are enforced.** They start when `prepare()` opens the session. A refused session (401 or 403), an
-  exhausted workspace (402), or three failed heartbeats in a row stop the character (see [States](#states)).
-  Transient failures are retried with backoff within those three attempts. When Yoob ends a session that went quiet
-  (an app suspended in the background), the SDK asks your `credentials` closure for a new one.
+- **Heartbeats are enforced.** They start when `prepare()` opens the session. Explicit denials stop the character at
+  once: a refused session (401 or 403), an exhausted workspace (402), or a `stop` reply for out of credit, a sandbox
+  limit, a suspended workspace or a revoked key (see [States](#states)).
+- **An outage doesn't stop characters.** If Yoob can't be reached (network errors, timeouts, 408, 429, 5xx), the
+  character keeps rendering for up to 10 minutes after the last successful heartbeat while the SDK retries, then
+  stops with `.sessionEnded("unreachable")`. `heartbeatOutageGraceSeconds` changes the window (0 to 1800). The
+  current download grant keeps being used meanwhile; if it expires during the outage, new downloads fail, but a
+  character that already loaded keeps rendering. When Yoob ends a session that went quiet (an app suspended in the
+  background), the SDK asks your `credentials` closure for a new one.
 - **Signed packs only.** Downloaded and shipped packs must carry a manifest signed by Yoob, and every file is checked
   against it.
 - **Voice only goes to Yoob.** Yoob voice connects only to `wss://*.yoob.com` unless you set `voiceHosts`.
@@ -372,6 +391,16 @@ machine. Before you deploy a token server, replace `requireUser()` with your own
   4. Always set the voice and instructions for voice sessions on the server.
   5. Build the request body yourself. Don't pass fields from the app through to Yoob.
   6. Keep the key in the server's environment, and return Yoob's response without logging tokens.
+
+## Changes in 0.4.1
+
+- A Yoob outage no longer stops characters after three failed heartbeats. Heartbeats that get no answer (network
+  errors, timeouts, 408, 429, 5xx, unreadable replies) are retried after 2 s, 6 s, then every 15 s while the character
+  keeps rendering. The session ends with `.sessionEnded("unreachable")` only when `heartbeatOutageGraceSeconds`
+  (new `YoobAvatar` init parameter and property, default 600, 0...1800) has passed since the last successful
+  heartbeat. Denials (401, 402, 403, terminal `stop` reasons) still stop the character at once, even during an outage.
+- New `avatar.isHeartbeatDegraded`, `avatar.onHeartbeatDegraded` and `avatar.onHeartbeatRecovered`. Without
+  `onHeartbeatDegraded`, the SDK logs a warning (subsystem `com.yoob.sdk`).
 
 ## Changes in 0.4.0
 

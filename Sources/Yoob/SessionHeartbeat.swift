@@ -2,9 +2,11 @@ import Foundation
 
 /// Sends a session's heartbeats from the moment it opens, and decides when the session must stop.
 ///
-/// Transient failures are retried with backoff. `maxFailures` failures in a row, a refused session (401, 403) or an
-/// exhausted workspace (402, or `stop` with `out-of-credits`) end the session. A session the API no longer knows (404,
-/// or `stop` for another reason, such as an app that slept in the background) is replaced through `renew`.
+/// A refused session (401, 403) or an exhausted workspace (402, or `stop` with a terminal reason) ends the session at
+/// once, even while degraded. Failures without an answer (network, timeout, 408, 429, 5xx, unreadable reply) only
+/// degrade it: they are retried with backoff, and the session ends as `.sessionEnded("unreachable")` once `outageGrace`
+/// has passed since the last successful heartbeat. A session the API no longer knows (404, or `stop` for another
+/// reason, such as an app that slept in the background) is replaced through `renew`.
 @MainActor
 final class SessionHeartbeat {
     struct Hooks {
@@ -16,33 +18,56 @@ final class SessionHeartbeat {
         var grant: (_ token: String, _ expiresAt: String?) -> Void
         /// The session can't continue. Called once, after the heartbeat has stopped.
         var ended: (YoobError) -> Void
+        /// Heartbeats started failing without an answer. The session keeps running while they are retried.
+        var degraded: (_ detail: String) -> Void = { _ in }
+        /// A heartbeat succeeded again after `degraded`.
+        var recovered: () -> Void = {}
     }
 
     typealias Send = @Sendable (YoobCredentials) async -> SessionAPI.Outcome
     typealias Sleep = @Sendable (Duration) async throws -> Void
+    typealias Now = () -> ContinuousClock.Instant
 
-    let maxFailures: Int
+    /// Default, least and most `outageGraceSeconds`.
+    nonisolated static let defaultOutageGraceSeconds = 600
+    nonisolated static let outageGraceRange = 0...1800
+    nonisolated static func clampOutageGrace(_ seconds: Int) -> Int {
+        min(outageGraceRange.upperBound, max(outageGraceRange.lowerBound, seconds))
+    }
+    /// The `.sessionEnded` detail when Yoob couldn't be reached for the whole grace window.
+    nonisolated static let unreachable = "unreachable"
+
+    let outageGrace: Duration
     private(set) var isRunning = false
     private(set) var consecutiveFailures = 0
+    /// Heartbeats are failing without an answer and being retried.
+    private(set) var isDegraded = false
     private let hooks: Hooks
     private let send: Send
     private let sleep: Sleep
+    private let now: Now
     private let retryDelay: (Int) -> Duration
+    private var lastSuccess: ContinuousClock.Instant
+    private var interval: Duration = .seconds(30)
     private var loop: Task<Void, Never>?
     private var inFlight: Task<Void, Never>?
     private var generation = 0
 
-    init(hooks: Hooks, maxFailures: Int = 3,
+    init(hooks: Hooks, outageGraceSeconds: Int = SessionHeartbeat.defaultOutageGraceSeconds,
          retryDelay: @escaping (Int) -> Duration = SessionHeartbeat.defaultRetryDelay,
          send: @escaping Send = { await SessionAPI.heartbeat($0) },
-         sleep: @escaping Sleep = { try await Task.sleep(for: $0) }) {
-        self.hooks = hooks; self.maxFailures = max(1, maxFailures)
-        self.retryDelay = retryDelay; self.send = send; self.sleep = sleep
+         sleep: @escaping Sleep = { try await Task.sleep(for: $0) },
+         now: @escaping Now = { ContinuousClock.now }) {
+        self.hooks = hooks
+        self.outageGrace = .seconds(Self.clampOutageGrace(outageGraceSeconds))
+        self.retryDelay = retryDelay; self.send = send; self.sleep = sleep; self.now = now
+        self.lastSuccess = now()
     }
 
-    /// 2 s after the first failure, 6 s after the second, with jitter.
+    /// 2 s after the first failure, 6 s after the second, then every 15 s, with jitter.
     nonisolated static func defaultRetryDelay(_ failures: Int) -> Duration {
-        .milliseconds(Int(Double(failures <= 1 ? 2_000 : 6_000) * Double.random(in: 0.8...1.2)))
+        let base = failures <= 1 ? 2_000 : failures == 2 ? 6_000 : 15_000
+        return .milliseconds(Int(Double(base) * Double.random(in: 0.8...1.2)))
     }
 
     /// Starts beating every `heartbeatSeconds` of the current credentials. `automatic: false` only arms the heartbeat,
@@ -51,6 +76,8 @@ final class SessionHeartbeat {
         guard !isRunning else { return }
         isRunning = true
         consecutiveFailures = 0
+        isDegraded = false
+        lastSuccess = now()
         generation += 1
         guard automatic else { return }
         let generation = generation
@@ -83,6 +110,10 @@ final class SessionHeartbeat {
     }
 
     private func beat(_ generation: Int) async {
+        if let seconds = hooks.credentials()?.heartbeatSeconds { interval = .seconds(max(5, seconds)) }
+        // Time the app wasn't beating at all (suspended in the background) isn't an outage: the grace window starts no
+        // earlier than one interval before this beat.
+        let anchor = max(lastSuccess, now() - interval)
         while isRunning, self.generation == generation {
             guard let credentials = hooks.credentials() else {
                 return end(.unauthorized)
@@ -91,7 +122,7 @@ final class SessionHeartbeat {
             guard isRunning, self.generation == generation else { return }
             switch outcome {
             case .ok(let reply):
-                consecutiveFailures = 0
+                succeeded()
                 return await handle(reply)
             case .fatal(let error):
                 return end(error)
@@ -99,12 +130,23 @@ final class SessionHeartbeat {
                 return await renew()
             case .transient(let detail):
                 consecutiveFailures += 1
-                if consecutiveFailures >= maxFailures {
-                    return end(.sessionEnded("the session could not be confirmed (\(detail))"))
+                let remaining = anchor + outageGrace - now()
+                guard remaining > .zero else { return end(.sessionEnded(Self.unreachable)) }
+                if !isDegraded {
+                    isDegraded = true
+                    hooks.degraded(detail)
                 }
-                do { try await sleep(retryDelay(consecutiveFailures)) } catch { return }
+                do { try await sleep(min(remaining, retryDelay(consecutiveFailures))) } catch { return }
             }
         }
+    }
+
+    private func succeeded() {
+        consecutiveFailures = 0
+        lastSuccess = now()
+        guard isDegraded else { return }
+        isDegraded = false
+        hooks.recovered()
     }
 
     private func handle(_ reply: SessionAPI.Reply) async {
@@ -119,7 +161,7 @@ final class SessionHeartbeat {
         let generation = generation
         do {
             try await hooks.renew()
-            if self.generation == generation { consecutiveFailures = 0 }
+            if self.generation == generation { succeeded() }
         } catch {
             guard self.generation == generation else { return }
             if case YoobError.outOfCredit = error { return end(.outOfCredit) }

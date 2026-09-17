@@ -2,7 +2,7 @@ import Foundation
 
 /// Yoob renders a talking character on the device from any speech audio.
 public enum Yoob {
-    public static let version = "0.4.0"
+    public static let version = "0.4.1"
 
     /// Removes every downloaded character except the versions currently loaded.
     public static func clearCache() async throws { try await AssetStore.shared.clear() }
@@ -25,8 +25,9 @@ public enum YoobError: Error, LocalizedError, Equatable {
     case renderer(String)
     /// The user hasn't allowed microphone access.
     case permissionDenied(String)
-    /// The session can't continue (heartbeats kept failing, or Yoob ended it and a new one couldn't be opened), so the
-    /// character stopped rendering. Call `prepare()` to start a new session.
+    /// The session can't continue, so the character stopped rendering. The detail is `"unreachable"` when heartbeats got
+    /// no answer for the whole outage grace window; otherwise Yoob ended the session and a new one couldn't be opened, a
+    /// sandbox session reached its limit, or the workspace is suspended. Call `prepare()` to start a new session.
     case sessionEnded(String)
     /// Yoob voice ended or refused the conversation. `code` is the WebSocket close code (for example 4009 when the
     /// session reached its time limit); `message` can be shown to the user.
@@ -42,6 +43,7 @@ public enum YoobError: Error, LocalizedError, Equatable {
         case .invalidAudio(let detail): "Yoob can't use this audio: \(detail)."
         case .renderer(let detail): "The character renderer stopped: \(detail)."
         case .permissionDenied(let detail): detail
+        case .sessionEnded(SessionHeartbeat.unreachable): "Yoob couldn't be reached, so the session ended."
         case .sessionEnded(let detail): "The Yoob session ended: \(detail)."
         case .voiceSession(_, let message): message
         }

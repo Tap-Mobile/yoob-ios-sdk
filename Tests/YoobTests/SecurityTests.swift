@@ -2,22 +2,38 @@ import XCTest
 import CryptoKit
 @testable import Yoob
 
-/// Answers heartbeats from a script and records what was sent.
+/// Answers heartbeats from a script, records what was sent, and keeps a clock that moves only when the heartbeat sleeps.
 final class HeartbeatScript: @unchecked Sendable {
     private let lock = NSLock()
     private var outcomes: [SessionAPI.Outcome]
+    private let answer: ((Duration) -> SessionAPI.Outcome)?
     private var _tokens: [String] = []
     private var _sleeps: [Duration] = []
-    init(_ outcomes: [SessionAPI.Outcome]) { self.outcomes = outcomes }
+    private var _beatTimes: [Duration] = []
+    private var _elapsed: Duration = .zero
+    let start = ContinuousClock.now
+    init(_ outcomes: [SessionAPI.Outcome]) { self.outcomes = outcomes; answer = nil }
+    /// Answers by the time elapsed on the fake clock.
+    init(answer: @escaping (Duration) -> SessionAPI.Outcome) { outcomes = []; self.answer = answer }
     var tokens: [String] { lock.withLock { _tokens } }
     var sleeps: [Duration] { lock.withLock { _sleeps } }
+    var beatTimes: [Duration] { lock.withLock { _beatTimes } }
+    var elapsed: Duration { lock.withLock { _elapsed } }
+    var now: ContinuousClock.Instant { start + elapsed }
+    func advance(_ duration: Duration) { lock.withLock { _elapsed += duration } }
     func next(_ credentials: YoobCredentials) -> SessionAPI.Outcome {
         lock.withLock {
             _tokens.append(credentials.sessionToken)
+            _beatTimes.append(_elapsed)
+            if let answer { return answer(_elapsed) }
             return outcomes.isEmpty ? .ok(.init()) : outcomes.removeFirst()
         }
     }
-    func slept(_ duration: Duration) { lock.withLock { _sleeps.append(duration) } }
+    func slept(_ duration: Duration) { lock.withLock { _sleeps.append(duration); _elapsed += duration } }
+}
+
+private extension Duration {
+    static func minutes(_ value: Int) -> Duration { .seconds(value * 60) }
 }
 
 @MainActor
@@ -27,8 +43,23 @@ final class HeartbeatTests: XCTestCase {
     private var grants: [String] = []
     private var renewals = 0
     private var renewError: Error?
+    private var events: [String] = []
 
-    private func heartbeat(_ script: HeartbeatScript) -> SessionHeartbeat {
+    /// 2 s, 6 s, then every 15 s, like the default, without jitter.
+    private static let backoff: (Int) -> Duration = { $0 <= 1 ? .seconds(2) : $0 == 2 ? .seconds(6) : .seconds(15) }
+
+    /// Fails until `until`, alternating 503s and network errors, then answers.
+    private static func outage(until: Duration) -> (Duration) -> SessionAPI.Outcome {
+        var count = 0
+        return { elapsed in
+            count += 1
+            if elapsed >= until { return .ok(.init()) }
+            return count % 2 == 1 ? .transient("HTTP 503") : .transient("offline")
+        }
+    }
+
+    private func heartbeat(_ script: HeartbeatScript, grace: Int = 600,
+                           retryDelay: @escaping (Int) -> Duration = { .seconds($0) }) -> SessionHeartbeat {
         let heartbeat = SessionHeartbeat(
             hooks: .init(
                 credentials: { [unowned self] in self.credentials },
@@ -38,36 +69,114 @@ final class HeartbeatTests: XCTestCase {
                     self.credentials = YoobCredentials(sessionToken: "st_\(self.renewals + 1)", downloadToken: "yg1.renewed")
                 },
                 grant: { [unowned self] token, _ in self.grants.append(token) },
-                ended: { [unowned self] in self.ended.append($0) }),
-            retryDelay: { .seconds($0) },
+                ended: { [unowned self] in self.ended.append($0) },
+                degraded: { [unowned self] in self.events.append("degraded \($0)") },
+                recovered: { [unowned self] in self.events.append("recovered") }),
+            outageGraceSeconds: grace,
+            retryDelay: retryDelay,
             send: { script.next($0) },
-            sleep: { script.slept($0) })
+            sleep: { script.slept($0) },
+            now: { script.now })
         heartbeat.start(automatic: false)
         return heartbeat
     }
 
-    func testThreeConsecutiveFailuresEndTheSessionAfterBackoff() async {
-        let script = HeartbeatScript([.transient("offline"), .transient("HTTP 503"), .transient("HTTP 409")])
-        let beat = heartbeat(script)
+    func testNineMinutesOfTransientFailuresKeepTheSessionThenItRecovers() async {
+        let script = HeartbeatScript(answer: Self.outage(until: .minutes(9)))
+        let beat = heartbeat(script, retryDelay: Self.backoff)
         await beat.beatNow()
-        XCTAssertEqual(script.tokens, ["st_1", "st_1", "st_1"])
-        XCTAssertEqual(script.sleeps, [.seconds(1), .seconds(2)])
-        XCTAssertEqual(ended.count, 1)
-        guard case .sessionEnded = ended.first else { return XCTFail("expected sessionEnded, got \(ended)") }
-        XCTAssertFalse(beat.isRunning)
-        await beat.beatNow()
-        XCTAssertEqual(script.tokens.count, 3, "no beats after the session ended")
-    }
-
-    func testASuccessResetsTheFailureCount() async {
-        let script = HeartbeatScript([.transient("a"), .transient("b"), .ok(.init()), .transient("c"), .transient("d"), .ok(.init())])
-        let beat = heartbeat(script)
-        await beat.beatNow()
-        XCTAssertEqual(beat.consecutiveFailures, 0)
-        await beat.beatNow()
-        XCTAssertEqual(script.tokens.count, 6)
         XCTAssertTrue(ended.isEmpty)
         XCTAssertTrue(beat.isRunning)
+        XCTAssertFalse(beat.isDegraded)
+        XCTAssertEqual(beat.consecutiveFailures, 0)
+        XCTAssertGreaterThan(script.tokens.count, 30, "retried through the outage")
+        XCTAssertEqual(Array(script.sleeps.prefix(4)), [.seconds(2), .seconds(6), .seconds(15), .seconds(15)])
+        XCTAssertGreaterThanOrEqual(script.beatTimes.last!, .minutes(9))
+        XCTAssertEqual(events, ["degraded HTTP 503", "recovered"])
+    }
+
+    func testTheGraceWindowRestartsAfterARecovery() async {
+        let first = Self.outage(until: .minutes(9)), second = Self.outage(until: .minutes(19))
+        let script = HeartbeatScript(answer: { $0 < .minutes(10) ? first($0) : second($0) })
+        let beat = heartbeat(script, retryDelay: Self.backoff)
+        await beat.beatNow()
+        script.advance(.minutes(10) - script.elapsed)
+        await beat.beatNow()
+        XCTAssertTrue(ended.isEmpty, "two 9-minute outages with a success between them are both survived")
+        XCTAssertEqual(events, ["degraded HTTP 503", "recovered", "degraded HTTP 503", "recovered"])
+    }
+
+    func testTenMinutesOfTransientFailuresEndTheSessionAsUnreachable() async {
+        let script = HeartbeatScript(answer: { _ in .transient("HTTP 502") })
+        let beat = heartbeat(script, retryDelay: Self.backoff)
+        await beat.beatNow()
+        XCTAssertEqual(ended, [.sessionEnded("unreachable")])
+        XCTAssertEqual(ended.first?.errorDescription, "Yoob couldn't be reached, so the session ended.")
+        XCTAssertFalse(beat.isRunning)
+        let times = script.beatTimes
+        XCTAssertGreaterThanOrEqual(times.last!, .minutes(10), "the last attempt lands on the deadline")
+        XCTAssertLessThan(times.last!, .minutes(10) + .seconds(15))
+        XCTAssertLessThan(times[times.count - 2], .minutes(10), "still retrying inside the window")
+        XCTAssertEqual(events, ["degraded HTTP 502"])
+        await beat.beatNow()
+        XCTAssertEqual(script.tokens.count, times.count, "no beats after the session ended")
+    }
+
+    func testA402StopsAtOnceEvenWhileDegraded() async {
+        let script = HeartbeatScript(answer: { $0 < .minutes(3) ? .transient("offline") : .fatal(.outOfCredit) })
+        let beat = heartbeat(script, retryDelay: Self.backoff)
+        await beat.beatNow()
+        XCTAssertEqual(ended, [.outOfCredit])
+        XCTAssertLessThan(script.beatTimes.last!, .minutes(4), "did not wait for the grace window")
+        XCTAssertEqual(events, ["degraded offline"])
+        XCTAssertFalse(beat.isRunning)
+
+        ended = []; events = []
+        let stopped = HeartbeatScript(answer: { $0 < .minutes(5) ? .transient("HTTP 500") : .ok(.init(stop: true, reason: "key-revoked")) })
+        let revoked = heartbeat(stopped, retryDelay: Self.backoff)
+        await revoked.beatNow()
+        XCTAssertEqual(ended, [.unauthorized])
+        XCTAssertFalse(revoked.isRunning)
+    }
+
+    func testTheGraceWindowIsConfigurable() async {
+        let strict = HeartbeatScript(answer: { _ in .transient("offline") })
+        await heartbeat(strict, grace: 0).beatNow()
+        XCTAssertEqual(strict.tokens.count, 1, "0 ends at the first failure")
+        XCTAssertEqual(ended, [.sessionEnded("unreachable")])
+
+        ended = []
+        let short = HeartbeatScript(answer: Self.outage(until: .seconds(90)))
+        await heartbeat(short, grace: 60, retryDelay: Self.backoff).beatNow()
+        XCTAssertEqual(ended, [.sessionEnded("unreachable")])
+        XCTAssertGreaterThanOrEqual(short.beatTimes.last!, .seconds(60))
+        XCTAssertLessThan(short.beatTimes.last!, .seconds(90))
+
+        ended = []
+        let capped = HeartbeatScript(answer: { _ in .transient("HTTP 500") })
+        let long = heartbeat(capped, grace: 99_999, retryDelay: Self.backoff)
+        XCTAssertEqual(long.outageGrace, .seconds(1800))
+        await long.beatNow()
+        XCTAssertGreaterThanOrEqual(capped.beatTimes.last!, .minutes(30))
+        XCTAssertLessThan(capped.beatTimes.last!, .minutes(30) + .seconds(15))
+        XCTAssertEqual(heartbeat(HeartbeatScript([]), grace: -5).outageGrace, .zero)
+
+        let avatar = YoobAvatar(.cloud(character: "luna-anime") { throw YoobError.unauthorized })
+        XCTAssertEqual(avatar.heartbeatOutageGraceSeconds, 600)
+        avatar.heartbeatOutageGraceSeconds = 5000
+        XCTAssertEqual(avatar.heartbeatOutageGraceSeconds, 1800)
+        XCTAssertEqual(YoobAvatar(.cloud(character: "luna-anime") { throw YoobError.unauthorized }, heartbeatOutageGraceSeconds: -1)
+            .heartbeatOutageGraceSeconds, 0)
+    }
+
+    func testTimeTheAppWasSuspendedDoesNotCountAgainstTheGraceWindow() async {
+        let script = HeartbeatScript(answer: Self.outage(until: .minutes(40)))
+        let beat = heartbeat(script, retryDelay: Self.backoff)
+        script.advance(.minutes(30))
+        await beat.beatNow()
+        XCTAssertEqual(ended, [.sessionEnded("unreachable")])
+        let times = script.beatTimes
+        XCTAssertGreaterThanOrEqual(times.last! - times.first!, .minutes(10) - .seconds(30), "retried for 10 minutes less one 30 s interval after resuming")
     }
 
     func testRefusedOrExhaustedSessionsStopAtOnce() async {

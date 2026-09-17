@@ -2,6 +2,7 @@ import Foundation
 import CoreGraphics
 import ImageIO
 import Observation
+import os
 import YoobRealistic
 
 /// A character that speaks the audio you give it. Create one per character, call `prepare()`, show it with
@@ -25,7 +26,8 @@ public final class YoobAvatar {
         /// Preparing failed. `prepare()` can be called again.
         case failed(YoobError)
         /// The session ended and the character stopped rendering: `.outOfCredit`, `.unauthorized`, or `.sessionEnded`
-        /// after heartbeats kept failing. `prepare()` starts a new session.
+        /// (`.sessionEnded("unreachable")` when Yoob couldn't be reached for `heartbeatOutageGraceSeconds`).
+        /// `prepare()` starts a new session.
         case stopped(YoobError)
     }
 
@@ -49,6 +51,19 @@ public final class YoobAvatar {
     /// Called when the session ends and the character stops rendering, with the same error `phase` holds in
     /// `.stopped`: `.outOfCredit`, `.unauthorized`, or `.sessionEnded`.
     @ObservationIgnored public var onSessionEnded: (@MainActor (YoobError) -> Void)?
+    /// How long the character keeps rendering while heartbeats get no answer (network errors, timeouts, 408, 429, 5xx),
+    /// counted from the last successful heartbeat. 0 stops at the first failure; values are clamped to 0...1800.
+    /// Default 600 (10 minutes). Refusals (401, 402, 403) stop the character at once regardless. Applies from the next
+    /// `prepare()`.
+    @ObservationIgnored public var heartbeatOutageGraceSeconds: Int {
+        didSet { heartbeatOutageGraceSeconds = SessionHeartbeat.clampOutageGrace(heartbeatOutageGraceSeconds) }
+    }
+    /// True while heartbeats are failing without an answer and being retried. The character keeps rendering.
+    public private(set) var isHeartbeatDegraded = false
+    /// Heartbeats started failing without an answer, with a short description of the failure. Not fatal.
+    @ObservationIgnored public var onHeartbeatDegraded: (@MainActor (String) -> Void)?
+    /// A heartbeat succeeded again after `onHeartbeatDegraded`.
+    @ObservationIgnored public var onHeartbeatRecovered: (@MainActor () -> Void)?
     /// Sync diagnostics: frames shown and frames skipped because rendering fell behind the audio.
     public private(set) var stats = Stats()
     /// Why the renderer stopped during the last utterance, if it did. The audio kept playing.
@@ -102,9 +117,11 @@ public final class YoobAvatar {
     private var utteranceCount = 0
     private var ticker: Task<Void, Never>?
 
-    public init(_ source: YoobSource, version: String? = nil) {
+    public init(_ source: YoobSource, version: String? = nil,
+                heartbeatOutageGraceSeconds: Int = 600) {
         self.source = source
         self.version = version
+        self.heartbeatOutageGraceSeconds = SessionHeartbeat.clampOutageGrace(heartbeatOutageGraceSeconds)
         player.onDrained = { [weak self] in Task { @MainActor in self?.playbackDrained() } }
     }
 
@@ -419,11 +436,15 @@ public final class YoobAvatar {
 
     private func startHeartbeat() {
         heartbeat?.stop()
+        isHeartbeatDegraded = false
         let heartbeat = SessionHeartbeat(hooks: .init(
             credentials: { [weak self] in self?.credentials },
             renew: { [weak self] in try await self?.renewSession() },
             grant: { [weak self] token, _ in self?.useGrant(token) },
-            ended: { [weak self] error in self?.sessionEnded(error) }))
+            ended: { [weak self] error in self?.sessionEnded(error) },
+            degraded: { [weak self] detail in self?.heartbeatDegraded(detail) },
+            recovered: { [weak self] in self?.heartbeatRecovered() }),
+            outageGraceSeconds: heartbeatOutageGraceSeconds)
         self.heartbeat = heartbeat
         heartbeat.start()
     }
@@ -450,8 +471,22 @@ public final class YoobAvatar {
         access?.downloadToken = token
     }
 
+    private static let log = Logger(subsystem: "com.yoob.sdk", category: "session")
+
+    private func heartbeatDegraded(_ detail: String) {
+        isHeartbeatDegraded = true
+        if let onHeartbeatDegraded { onHeartbeatDegraded(detail) }
+        else { Self.log.warning("Yoob heartbeat failed (\(detail, privacy: .public)); retrying while the character keeps rendering.") }
+    }
+
+    private func heartbeatRecovered() {
+        isHeartbeatDegraded = false
+        onHeartbeatRecovered?()
+    }
+
     private func sessionEnded(_ reason: YoobError) {
         heartbeat = nil
+        isHeartbeatDegraded = false
         interrupt()
         microphone.stop()
         player.shutdown()
