@@ -238,6 +238,12 @@ protocol RealtimeSocket: AnyObject, Sendable {
     func send(_ text: String)
     func receive() async throws -> String
     func close()
+    /// Why the server closed the connection, when it said (for example "1008: token expired").
+    var closeReason: String? { get }
+}
+
+extension RealtimeSocket {
+    var closeReason: String? { nil }
 }
 
 final class URLSessionRealtimeSocket: RealtimeSocket, @unchecked Sendable {
@@ -253,4 +259,9 @@ final class URLSessionRealtimeSocket: RealtimeSocket, @unchecked Sendable {
         }
     }
     func close() { task.cancel(with: .normalClosure, reason: nil) }
+    var closeReason: String? {
+        guard task.closeCode != .invalid else { return nil }
+        let reason = task.closeReason.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        return reason.isEmpty ? "\(task.closeCode.rawValue)" : "\(task.closeCode.rawValue): \(reason)"
+    }
 }

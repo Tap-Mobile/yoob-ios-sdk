@@ -5,7 +5,7 @@ at 25 fps, entirely on the device. Your LLM, voice and UI stay yours.
 
 - **Small install.** The package adds about 1.8 MB to your app. Character files (26–40 MB) download on first use from
   `cdn.yoob.com` in verified, resumable chunks, and on a good connection the character's picture appears within about a second.
-- **Any voice.** Pass mono 16-bit PCM from OpenAI Realtime, ElevenLabs, your own TTS, or a recording.
+- **Any voice.** Pass mono 16-bit PCM from OpenAI Realtime, Gemini Live, ElevenLabs, your own TTS, or a recording.
 - **Private by design.** The SDK sends Yoob only the three things listed under [Network](#network). No audio, text or
   frames ever leave the device through Yoob.
 
@@ -122,6 +122,61 @@ much of it was heard.
 In a noisy room, raise the server VAD threshold instead of muting the microphone.
 
 Add `NSMicrophoneUsageDescription` to your Info.plist.
+
+## Talk with it: Gemini Live
+
+Bring your own Gemini voice with `YoobGeminiConversation`. It has the same states, transcripts and barge-in as
+`YoobConversation`.
+
+```swift
+var options = YoobGeminiConversation.Options()
+options.voice = "Kore"
+options.systemInstruction = "You are Luna, a warm, curious companion."
+options.greet = true
+
+let conversation = YoobGeminiConversation(avatar: avatar, options: options) {
+    try await MyBackend.geminiToken()          // an ephemeral token's `name`, created on your server
+}
+try await conversation.start()                 // asks for the microphone
+// conversation.state, .userTranscript and .assistantTranscript are observable, for captions.
+conversation.stop()
+```
+
+The app never sees your Gemini API key. Your backend creates a single-use
+[ephemeral token](https://ai.google.dev/gemini-api/docs/live-api/ephemeral-tokens) and returns its `name`:
+
+```js
+// POST /gemini-token on your server (Node, @google/genai)
+const token = await ai.authTokens.create({
+  config: {
+    uses: 1,
+    expireTime: new Date(Date.now() + 30 * 60_000).toISOString(),    // messages stop after this
+    newSessionExpireTime: new Date(Date.now() + 60_000).toISOString(), // the app must connect before this
+    liveConnectConstraints: { model: "gemini-3.8-live" },              // optional: lock the model
+  },
+});
+return { name: token.name };
+```
+
+The REST equivalent is `POST https://generativelanguage.googleapis.com/v1beta/auth_tokens` with the `x-goog-api-key`
+header. Settings locked with `liveConnectConstraints` take precedence over the ones the app sends.
+
+The conversation connects to Gemini's `BidiGenerateContentConstrained` WebSocket with the token. It converts the
+microphone's 24 kHz audio to the 16 kHz Gemini expects, and plays Gemini's 24 kHz replies through the avatar.
+
+| Option | Default | Why |
+|---|---|---|
+| `model` | `gemini-3.8-live` | Google's recommended low-latency native-audio Live model |
+| `voice` | Gemini's choice | Any prebuilt voice name, for example `Kore` or `Puck` |
+| `activityDetection.startSensitivity` | `.high` | Quick barge-in. Use `.low` in noisy rooms. |
+| `activityDetection.endSensitivity` | `.high` | Ends the user's turn sooner |
+| `activityDetection.silenceMS` | `450` | The silence window Yoob measured as fastest with OpenAI |
+| `activityDetection.prefixPaddingMS` | `100` | Short enough for one-word answers |
+| `inputTranscription` / `outputTranscription` | `true` | Captions for both sides |
+
+`send(text:)` sends a typed turn. `goAwayTimeLeft` is set when Gemini is about to close the connection: audio-only
+sessions last up to 15 minutes. Gemini doesn't report when a user turn ends, so a spoken turn goes from `.listening`
+straight to `.speaking`. `.thinking` appears after `greet` and `send(text:)`.
 
 ## Microphone controls
 
