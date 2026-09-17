@@ -137,6 +137,43 @@ ForEach(mic.inputs) { input in                         // built-in, wired and Bl
 `mic.state` is `.off`, `.starting`, `.live`, `.muted` or `.failed(error)`. Using your own voice stack? Set
 `mic.onAudio` (24 kHz PCM16) and call `try await mic.start()`.
 
+## LiveKit agents
+
+The optional `YoobLiveKit` product gives a [LiveKit](https://docs.livekit.io/agents/) voice agent a Yoob face,
+rendered on the phone. The agent needs no avatar worker and publishes no video: LiveKit plays the agent's voice
+(with its own echo cancellation), and the character follows the same audio. Add the `YoobLiveKit` product to your
+target; apps that only add `Yoob` do not link LiveKit.
+
+```swift
+import LiveKit
+import Yoob
+import YoobLiveKit
+
+let session = YoobLiveKitSession(avatar: avatar, room: Room())
+try await session.start(url: liveKitURL, token: token)   // token from your backend; publishes the microphone
+// session.state (.connecting, .listening, .thinking, .speaking, .ended), .userTranscript and
+// .assistantTranscript are observable.
+try await session.setMicrophoneEnabled(false)            // mute
+await session.stop()                                     // disconnects if start() connected
+```
+
+Pass no `url` to use a room you already connected. The session follows the first agent participant in the room
+(`options.agentIdentity` picks one) and reads captions from the agent's `lk.transcription` text streams (turn
+`options.transcriptions` off if your app handles that topic itself).
+
+- **Replies.** LiveKit Agents publishes the agent's state in the `lk.agent.state` attribute. A reply starts when the
+  agent is `speaking` and its voice is audible, and ends when it leaves `speaking`; if the voice was still sounding
+  then (the user interrupted), the face stops as soon as the audio already on its way does. Agents without the
+  attribute are split on 600 ms of silence (`options.silenceGate`).
+- **Sync.** LiveKit hands the session each 10 ms of audio as the audio device takes it, so the listener hears it one
+  output latency later. The session measures that from the audio session (`outputLatency + ioBufferDuration`) at the
+  start of each reply. Set `options.outputLatency` to fix it, or nudge the lips with `options.syncOffset` (positive is
+  later), for example for Bluetooth headphones.
+
+`YoobLiveKit` pins LiveKit Swift 2.17.0, which needs Xcode 16.3 or later. Swift Package Manager still downloads
+LiveKit and its WebRTC binary (about 185 MB) when it resolves this package, even for apps that only use `Yoob`;
+nothing from it is built or linked into those apps.
+
 ## Characters
 
 | Id | Style | Download | On device |
