@@ -93,6 +93,50 @@ avatar.audioPlayed(samples: samplesHeardSoFar)   // call often, e.g. from your a
 avatar.endSpeech()
 ```
 
+## Talk with it: OpenAI Realtime
+
+```swift
+var options = YoobConversation.Options()
+options.voice = "marin"
+options.instructions = "You are Luna, a warm, curious companion."
+options.greet = true
+
+let conversation = YoobConversation(avatar: avatar, options: options) {
+    try await MyBackend.openAIClientSecret()   // POST /v1/realtime/client_secrets on your server
+}
+try await conversation.start()                 // asks for the microphone
+// conversation.state, .userTranscript and .assistantTranscript are observable, for captions.
+conversation.stop()
+```
+
+The microphone stays open while the character speaks, so the user can interrupt it; iOS voice processing removes the
+character's voice from what is captured. When the user starts talking, the reply stops and OpenAI is told exactly how
+much of it was heard.
+
+| Option | Default | Why |
+|---|---|---|
+| `turnDetection` | `.serverVAD()`, 450 ms silence | Replies start about 0.8 s sooner than `.semantic` in Yoob's measurements |
+| `noiseReduction` | `far_field` | A phone held away from the face |
+| `speed` | `1.08` | Natural but snappy |
+
+In a noisy room, raise the server VAD threshold instead of muting the microphone.
+
+Add `NSMicrophoneUsageDescription` to your Info.plist.
+
+## Microphone controls
+
+```swift
+let mic = avatar.microphone
+mic.setMuted(!mic.isMuted)
+Gauge(value: mic.level) { EmptyView() }               // 0...1, about 20 updates a second
+ForEach(mic.inputs) { input in                         // built-in, wired and Bluetooth inputs
+    Button(input.name) { try? mic.select(inputID: input.id) }
+}
+```
+
+`mic.state` is `.off`, `.starting`, `.live`, `.muted` or `.failed(error)`. Using your own voice stack? Set
+`mic.onAudio` (24 kHz PCM16) and call `try await mic.start()`.
+
 ## Characters
 
 | Id | Style | Download | On device |
