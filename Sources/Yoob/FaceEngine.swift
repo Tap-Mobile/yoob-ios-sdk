@@ -42,9 +42,20 @@ final class RealisticEngine: FaceEngine {
             return pack
         }.value
         // GPU: ready in well under a second once compiled. The Neural Engine's first specialization takes minutes.
-        let models = try await AvatarModels.load(pack: pack, units: .cpuAndGPU)
+        var models = try await AvatarModels.load(pack: pack, units: .cpuAndGPU)
         try await models.warmUp()
+        // Some GPUs (the iOS Simulator's among them) return an empty picture from this renderer. Check one frame and
+        // fall back to the CPU rather than show a black square.
+        if try await rendersBlank(models, pack: pack) {
+            models = try await AvatarModels.load(pack: pack, cpuOnly: true)
+            if try await rendersBlank(models, pack: pack) { throw YoobError.renderer("the renderer produced an empty frame") }
+        }
         return RealisticEngine(avatar: StreamingAvatar(models: models, pack: pack))
+    }
+
+    private static func rendersBlank(_ models: AvatarModels, pack: AvatarPack) async throws -> Bool {
+        let crop = try await models.renderCrop(frame: 0, audio: pack.closedAudio)
+        return !crop.contains { $0 > 8 }
     }
 
     func append(_ samples: [Float]) async throws {

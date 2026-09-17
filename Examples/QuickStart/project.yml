@@ -1,0 +1,32 @@
+name: QuickStart
+options:
+  bundleIdPrefix: com.yoob.examples
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  Yoob:
+    path: ../..
+targets:
+  QuickStart:
+    type: application
+    platform: iOS
+    sources: [QuickStart]
+    dependencies:
+      - package: Yoob
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yoob.examples.quickstart
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: QuickStart/Info.plist
+      properties:
+        CFBundleDisplayName: Yoob
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        # Your backend's endpoint that returns a Yoob session (see Examples/token-server).
+        YoobTokenURL: http://localhost:3100/yoob-session
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true

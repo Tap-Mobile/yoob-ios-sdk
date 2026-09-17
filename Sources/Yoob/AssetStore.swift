@@ -5,7 +5,7 @@ import CryptoKit
 public struct YoobProgress: Sendable, Equatable {
     public let completedBytes: Int
     public let totalBytes: Int
-    public var fraction: Double { totalBytes == 0 ? 1 : Double(completedBytes) / Double(totalBytes) }
+    public var fraction: Double { totalBytes == 0 ? 0 : Double(completedBytes) / Double(totalBytes) }
 }
 
 /// Downloads character packs from the CDN in content-addressed chunks, verifies every chunk and file, and keeps them in
@@ -17,6 +17,8 @@ actor AssetStore {
     private let root: URL
     private let session: URLSession
     private var inUse: Set<String> = []
+    /// Downloads in progress by destination path. A second request for the same file waits for the first.
+    private var inFlight: [String: Task<Void, Error>] = [:]
     private static let parallelChunks = 6
 
     init(root: URL = URL.applicationSupportDirectory.appendingPathComponent("Yoob", isDirectory: true),
@@ -74,7 +76,7 @@ actor AssetStore {
 
     /// Downloads every file whose tier is at most `throughTier`. Files already verified are skipped.
     func download(_ manifest: CharacterManifest, throughTier: Int, credentials: YoobCredentials,
-                  progress: @Sendable (YoobProgress) -> Void) async throws -> URL {
+                  progress: @escaping @Sendable (YoobProgress) -> Void) async throws -> URL {
         let directory = packDirectory(manifest)
         inUse.insert(directory.path)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -90,12 +92,20 @@ actor AssetStore {
         }
         progress(YoobProgress(completedBytes: done, totalBytes: total))
 
-        for file in pending {
-            try Task.checkCancellation()
-            try await download(file, into: directory, credentials: credentials) { bytes in
-                done += bytes
-                progress(YoobProgress(completedBytes: done, totalBytes: total))
+        // Up to four files at a time; each file fetches its own chunks in parallel, and URLSession caps connections.
+        let counter = ProgressCounter(done: done, total: total, report: progress)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            var queue = pending.makeIterator()
+            func enqueue() {
+                guard let file = queue.next() else { return }
+                group.addTask {
+                    try await self.download(file, into: directory, credentials: credentials) { bytes in
+                        counter.add(bytes)
+                    }
+                }
             }
+            for _ in 0..<4 { enqueue() }
+            while try await group.next() != nil { enqueue() }
         }
         if manifest.files.allSatisfy({ isVerified($0, in: directory) }) {
             try Data().write(to: directory.appendingPathComponent(".complete"))
@@ -105,7 +115,21 @@ actor AssetStore {
     }
 
     private func download(_ file: CharacterManifest.File, into directory: URL, credentials: YoobCredentials,
-                          counted: (Int) -> Void) async throws {
+                          counted: @escaping @Sendable (Int) -> Void) async throws {
+        let key = directory.appendingPathComponent(file.path).path
+        if let running = inFlight[key] {
+            try await running.value
+            counted(file.size)
+            return
+        }
+        let task = Task { try await self.fetchFile(file, into: directory, credentials: credentials, counted: counted) }
+        inFlight[key] = task
+        defer { inFlight[key] = nil }
+        try await task.value
+    }
+
+    private func fetchFile(_ file: CharacterManifest.File, into directory: URL, credentials: YoobCredentials,
+                           counted: @Sendable (Int) -> Void) async throws {
         let destination = directory.appendingPathComponent(file.path)
         let partial = destination.appendingPathExtension("part")
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -234,5 +258,20 @@ actor AssetStore {
         var hash = SHA256()
         while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { hash.update(data: chunk) }
         return Hex.string(hash.finalize())
+    }
+}
+
+/// Thread-safe byte counter that reports progress as files finish chunks.
+final class ProgressCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done: Int
+    private let total: Int
+    private let report: @Sendable (YoobProgress) -> Void
+    init(done: Int, total: Int, report: @escaping @Sendable (YoobProgress) -> Void) {
+        self.done = done; self.total = total; self.report = report
+    }
+    func add(_ bytes: Int) {
+        lock.lock(); done += bytes; let value = YoobProgress(completedBytes: done, totalBytes: total); lock.unlock()
+        report(value)
     }
 }

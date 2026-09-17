@@ -40,6 +40,11 @@ public final class YoobAvatar {
     /// Width over height of every frame this character draws.
     public private(set) var aspectRatio: CGFloat = 9.0 / 16.0
     public private(set) var manifest: CharacterManifest?
+    /// The character id this avatar was created for (nil for a local pack until it is opened).
+    public var character: String? {
+        if case .cloud(let character, _) = source { return character }
+        return manifest?.character
+    }
     /// Sync diagnostics: frames shown and frames skipped because rendering fell behind the audio.
     public private(set) var stats = Stats()
     /// Why the renderer stopped during the last utterance, if it did. The audio kept playing.
@@ -109,7 +114,10 @@ public final class YoobAvatar {
         defer { preparing = nil }
         do { try await task.value }
         catch {
-            let failure = (error as? YoobError) ?? .renderer(error.localizedDescription)
+            let failure: YoobError
+            if let known = error as? YoobError { failure = known }
+            else if error is CocoaError || error is URLError { failure = .network(error.localizedDescription) }
+            else { failure = .renderer(error.localizedDescription) }
             if !(error is CancellationError) { phase = .failed(failure) }
             throw failure
         }
