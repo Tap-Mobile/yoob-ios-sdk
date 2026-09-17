@@ -1,0 +1,10 @@
+Yoob SDK for iOS
+Copyright 2026 Tap Mobile
+
+This product includes software developed at Tap Mobile (https://yoob.com).
+
+The realistic renderer follows the FeatherTalk design (Apache-2.0), itself based on
+Ultralight-Digital-Human (https://github.com/anliyuan/Ultralight-Digital-Human).
+
+Character model files are not part of this repository. They are licensed separately and
+downloaded from the Yoob CDN with credentials issued by Yoob.
