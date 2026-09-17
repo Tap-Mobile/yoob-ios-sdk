@@ -110,7 +110,8 @@ final class SessionHeartbeat {
     private func handle(_ reply: SessionAPI.Reply) async {
         if let grant = reply.grant, !grant.isEmpty { hooks.grant(grant, reply.grantExpiresAt) }
         guard reply.stop else { return }
-        if reply.reason == "out-of-credits" { return end(.outOfCredit) }
+        if let terminal = SessionAPI.terminalStop(reply.reason) { return end(terminal) }
+        // The API ended the session because it went quiet (an app suspended in the background): open a new one.
         await renew()
     }
 
@@ -136,8 +137,10 @@ final class SessionHeartbeat {
 enum SessionAPI {
     struct Reply: Decodable, Equatable {
         let stop: Bool
+        /// `out-of-credits`, `sandbox-limit`, `suspended`, `key-revoked`, `abandoned` or `ended`.
         let reason: String?
-        /// A renewed download grant, when the current one is close to expiring.
+        /// A renewed download grant, sent when the current one is close to expiring: `download_token`, or the older
+        /// name `grant`.
         let grant: String?
         let grantExpiresAt: String?
 
@@ -149,16 +152,36 @@ enum SessionAPI {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             stop = (try? c.decodeIfPresent(Bool.self, forKey: .stop)) ?? false
             reason = try? c.decodeIfPresent(String.self, forKey: .reason)
-            grant = try? c.decodeIfPresent(String.self, forKey: .grant)
-            if let text = try? c.decodeIfPresent(String.self, forKey: .grantExpiresAt) {
-                grantExpiresAt = text
-            } else if let seconds = try? c.decodeIfPresent(Double.self, forKey: .grantExpiresAt) {
-                grantExpiresAt = String(Int(seconds))
-            } else {
-                grantExpiresAt = nil
-            }
+            let pairs: [(CodingKeys, CodingKeys)] = [(.downloadToken, .downloadTokenExpiresAt), (.grant, .grantExpiresAt)]
+            let found = pairs.lazy.compactMap { token, expiry -> (String, CodingKeys)? in
+                guard let value = try? c.decodeIfPresent(String.self, forKey: token), !value.isEmpty else { return nil }
+                return (value, expiry)
+            }.first
+            grant = found?.0
+            grantExpiresAt = found.flatMap { Self.timestamp(c, $0.1) }
         }
-        enum CodingKeys: String, CodingKey { case stop, reason, grant, grantExpiresAt = "grant_expires_at" }
+
+        private static func timestamp(_ c: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> String? {
+            if let text = try? c.decodeIfPresent(String.self, forKey: key) { return text }
+            if let seconds = try? c.decodeIfPresent(Double.self, forKey: key) { return String(Int(seconds)) }
+            return nil
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case stop, reason, grant, grantExpiresAt = "grant_expires_at"
+            case downloadToken = "download_token", downloadTokenExpiresAt = "download_token_expires_at"
+        }
+    }
+
+    /// Why a stopped session can't simply be replaced, or nil when a new session may be opened.
+    static func terminalStop(_ reason: String?) -> YoobError? {
+        switch reason {
+        case "out-of-credits": .outOfCredit
+        case "sandbox-limit": .sessionEnded("this sandbox session reached its time limit")
+        case "suspended": .sessionEnded("this Yoob workspace is suspended")
+        case "key-revoked": .unauthorized
+        default: nil
+        }
     }
 
     enum Outcome: Equatable {
@@ -186,8 +209,10 @@ enum SessionAPI {
                 return .transient("unreadable heartbeat reply")
             }
             return .ok(reply)
-        case 401, 403: return .fatal(.unauthorized)
-        case 402: return .fatal(.outOfCredit)
+        case 401, 402, 403:
+            let reply = try? JSONDecoder().decode(Reply.self, from: body)
+            if let terminal = terminalStop(reply?.reason) { return .fatal(terminal) }
+            return .fatal(status == 402 ? .outOfCredit : .unauthorized)
         case 404, 410: return .gone
         default: return .transient("HTTP \(status)")
         }

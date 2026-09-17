@@ -75,6 +75,8 @@ final class HeartbeatTests: XCTestCase {
             (.fatal(.unauthorized), .unauthorized),
             (.fatal(.outOfCredit), .outOfCredit),
             (.ok(.init(stop: true, reason: "out-of-credits")), .outOfCredit),
+            (.ok(.init(stop: true, reason: "sandbox-limit")), .sessionEnded("this sandbox session reached its time limit")),
+            (.ok(.init(stop: true, reason: "key-revoked")), .unauthorized),
         ]
         for (outcome, expected) in cases {
             ended = []
@@ -135,6 +137,13 @@ final class HeartbeatTests: XCTestCase {
              .ok(.init(grant: "yg1.x", grantExpiresAt: "2026-09-17T13:00:00Z"))),
             (200, #"{"grant":"yg1.x","grant_expires_at":1790000000}"#, .ok(.init(grant: "yg1.x", grantExpiresAt: "1790000000"))),
             (200, #"{"grant":null}"#, .ok(.init())),
+            (200, #"{"stop":false,"credits_remaining":9,"billed_seconds":15,"reason":null,"download_token":"yg1.d","download_token_expires_at":1790000000}"#,
+             .ok(.init(grant: "yg1.d", grantExpiresAt: "1790000000"))),
+            (200, #"{"download_token":"yg1.d","grant":"yg1.old"}"#, .ok(.init(grant: "yg1.d"))),
+            (200, #"{"download_token":"","grant":"yg1.old","grant_expires_at":"soon"}"#, .ok(.init(grant: "yg1.old", grantExpiresAt: "soon"))),
+            (402, #"{"stop":true,"reason":"suspended","code":"suspended"}"#, .fatal(.sessionEnded("this Yoob workspace is suspended"))),
+            (403, #"{"stop":true,"reason":"key-revoked","code":"key_revoked"}"#, .fatal(.unauthorized)),
+            (402, #"{"code":"quota_exceeded"}"#, .fatal(.outOfCredit)),
             (200, "", .ok(.init())),
             (200, "not json", .transient("unreadable heartbeat reply")),
             (401, "{}", .fatal(.unauthorized)),

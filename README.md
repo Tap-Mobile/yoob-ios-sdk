@@ -280,8 +280,9 @@ and an update downloads only the files that changed.
 | `.failed(error)` | Loading failed. Call `prepare()` again to resume. |
 | `.stopped(error)` | The session ended and the character stopped rendering. See below. |
 
-The session stops when the workspace is out of credit (`.outOfCredit`), when Yoob refuses the session
-(`.unauthorized`), or after three heartbeats in a row fail (`.sessionEnded`). The avatar then stops rendering,
+The session stops when the workspace is out of credit (`.outOfCredit`), when Yoob refuses the session or its API key
+was revoked (`.unauthorized`), or with `.sessionEnded` after three heartbeats in a row fail, when a sandbox session
+reaches its time limit, or when the workspace is suspended. The avatar then stops rendering,
 `speak` throws the same error, and `avatar.onSessionEnded` is called. `prepare()` opens a new session.
 
 ```swift
@@ -351,8 +352,9 @@ machine. Before you deploy a token server, replace `requireUser()` with your own
 - **Keys stay on your server.** A Yoob API key never belongs in an app, a web page or a repository. The API rejects
   key calls that come from a browser, and an app binary can be taken apart, so keep the key in your server's
   environment. The app only ever holds a session token, a download grant and a voice token.
-- **Test keys for development.** A `yoob_test_` key opens sandbox sessions that don't use credits. Sandbox mode comes
-  from the key alone; there is no request flag for it.
+- **Test keys for development.** A `yoob_test_` key opens sandbox sessions that don't use credits and are limited in
+  length (a few minutes each, with a daily total). Sandbox mode comes from the key alone; there is no request flag
+  for it.
 - **Grants are short-lived and per character.** A download grant covers the characters its session was opened for and
   expires soon. Heartbeats may hand the SDK a renewed grant, which it uses from the next download request on. A voice
   token opens one conversation and must be used within 5 minutes.
@@ -376,7 +378,9 @@ machine. Before you deploy a token server, replace `requireUser()` with your own
 - `.local(url)` is now `.local(url, credentials:)`. Local packs need `character.signed.json` and a metered session.
 - Heartbeats start with `prepare()` and are enforced. New `YoobError.sessionEnded`, `avatar.onSessionEnded` and
   `avatar.refreshSession()`.
-- Heartbeat replies may carry a renewed download grant (`grant`, `grant_expires_at`); older replies still work.
+- Heartbeat replies may carry a renewed download grant (`download_token`, `download_token_expires_at`; `grant` and
+  `grant_expires_at` are also accepted); older replies still work. `stop` with `sandbox-limit` or `suspended` ends the
+  session as `.sessionEnded`, and `key-revoked` as `.unauthorized`.
 - Yoob voice connects only to `wss://*.yoob.com` unless `YoobConversation.Options.voiceHosts` says otherwise.
 - The example token server fails closed without auth, allowlists characters (`YOOB_CHARACTERS`, default
   `luna-realistic,luna-anime`), rate-limits each user, always pins the voice prompt, and never passes request fields
