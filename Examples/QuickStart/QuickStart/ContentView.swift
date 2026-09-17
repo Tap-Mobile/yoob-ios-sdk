@@ -136,10 +136,13 @@ struct ContentView: View {
     private func toggleTalk() {
         if isTalking { conversation?.stop(); return }
         var options = YoobConversation.Options()
-        options.voice = "marin"
-        options.instructions = "You are Luna, a warm, curious companion. Keep replies short and natural."
         options.greet = true
-        let conversation = YoobConversation(avatar: avatar, options: options, clientSecret: Backend.openAIClientSecret)
+        // Yoob voice: the backend sets Luna's voice and prompt. To use your own OpenAI account instead, set
+        // options.voice and options.instructions and pass `clientSecret: Backend.openAIClientSecret`.
+        let character = character
+        let conversation = YoobConversation(avatar: avatar, options: options) {
+            try await Backend.voiceSession(for: character)
+        }
         self.conversation = conversation
         Task { try? await conversation.start() }
     }

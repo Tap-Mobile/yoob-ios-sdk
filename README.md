@@ -1,13 +1,15 @@
 # Yoob for iOS
 
 Talking characters that render on the iPhone. You give Yoob speech audio; it plays the audio and moves the face in sync,
-at 25 fps, entirely on the device. Your LLM, voice and UI stay yours.
+at 25 fps, entirely on the device. Add Yoob voice for a live spoken conversation with no provider key, or bring your
+own LLM and voice.
 
 - **Small install.** The package adds about 1.8 MB to your app. Character files (26–40 MB) download on first use from
   `cdn.yoob.com` in verified, resumable chunks, and on a good connection the character's picture appears within about a second.
-- **Any voice.** Pass mono 16-bit PCM from OpenAI Realtime, Gemini Live, ElevenLabs, your own TTS, or a recording.
-- **Private by design.** The SDK sends Yoob only the three things listed under [Network](#network). No audio, text or
-  frames ever leave the device through Yoob.
+- **Any voice.** Talk through Yoob voice, or pass mono 16-bit PCM from OpenAI Realtime, Gemini Live, ElevenLabs, your
+  own TTS, or a recording.
+- **Private by design.** Faces render on the device. The SDK sends Yoob only what is listed under [Network](#network):
+  conversation audio goes through Yoob only when you use Yoob voice.
 
 Requires iOS 17 or later and Xcode 16 or later. The current preview release is 0.1.0.
 
@@ -93,7 +95,68 @@ avatar.audioPlayed(samples: samplesHeardSoFar)   // call often, e.g. from your a
 avatar.endSpeech()
 ```
 
-## Talk with it: OpenAI Realtime
+## Talk with it: Yoob voice
+
+No provider key needed; minutes are billed through your Yoob workspace. Yoob hosts the voice (OpenAI Realtime) and
+tunes it for the characters: server turn detection, far-field noise reduction, captions and a 1.08 speaking speed.
+
+```swift
+var options = YoobConversation.Options()
+options.greet = true
+
+let conversation = YoobConversation(avatar: avatar, options: options) {
+    try await MyBackend.yoobVoiceSession()     // returns YoobVoiceSession
+}
+try await conversation.start()                 // asks for the microphone
+// conversation.state, .userTranscript and .assistantTranscript are observable, for captions.
+conversation.stop()
+```
+
+Your backend asks Yoob for a voice session with your API key, and returns the response body unchanged:
+
+```sh
+curl -X POST https://api2.yoob.com/api/v1/voice/sessions \
+  -H "Authorization: Bearer $YOOB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"voice": "marin", "instructions": "You are Luna, a warm, curious companion.", "max_seconds": 900}'
+```
+
+The `201` response has `voice_session_id`, `voice_token`, `url` (`wss://voice.yoob.com/v1/realtime?model=…`),
+`model`, `max_seconds`, `credits_per_minute` and `expires_at`. The app decodes it with
+`JSONDecoder().decode(YoobVoiceSession.self, from: data)`.
+[`Examples/token-server`](Examples/token-server/server.mjs) has a `/yoob-voice` route.
+
+- **One session per conversation.** A voice session opens exactly one connection, and its token must be used within 5
+  minutes. `start()` asks for a new one every time, so don't cache it.
+- **Voice and instructions.** Set them on your backend: the app can't change them, and the prompt never reaches the
+  device. `voice` is one of `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin` or
+  `cedar`, and `instructions` can be up to 8,000 characters. If the backend leaves them out, `options.voice` and
+  `options.instructions` are used instead.
+- **Fixed settings.** Yoob sets the model, turn detection, noise reduction, transcription and speed, so those options
+  are ignored.
+- **Errors.** When the workspace is out of credit, the API answers `402 {"code": "quota_exceeded"}`, and decoding it
+  throws `YoobError.outOfCredit`. A rejected API key throws `.unauthorized`. If the voice service ends the call,
+  `lastError` is `.voiceSession(code:message:)`, and its `localizedDescription` is a message you can show the user:
+
+| Close code | Message |
+|---|---|
+| 4001, 4002, 4003 | The voice session was refused, had expired, or was already used. Start the conversation again. |
+| 4008 | This conversation reached its usage limit. |
+| 4009 | This conversation reached its time limit (`max_seconds`). |
+| 4010 | The conversation ended because it was idle for too long. |
+| 4029 | Voice has reached its usage limit for now (too many conversations at once, or the daily quota). Try again later. |
+| 1013 | Voice is busy right now. Try again in a moment. |
+| 1011 | The voice service disconnected. Start the conversation again. |
+
+The microphone stays open while the character speaks, so the user can interrupt it; iOS voice processing removes the
+character's voice from what is captured. When the user starts talking, the reply stops and the model is told exactly
+how much of it was heard.
+
+Add `NSMicrophoneUsageDescription` to your Info.plist.
+
+## Talk with it: your own OpenAI account
+
+Pass `clientSecret` instead of a voice session, and OpenAI bills your account directly:
 
 ```swift
 var options = YoobConversation.Options()
@@ -104,14 +167,11 @@ options.greet = true
 let conversation = YoobConversation(avatar: avatar, options: options) {
     try await MyBackend.openAIClientSecret()   // POST /v1/realtime/client_secrets on your server
 }
-try await conversation.start()                 // asks for the microphone
-// conversation.state, .userTranscript and .assistantTranscript are observable, for captions.
-conversation.stop()
+try await conversation.start()
 ```
 
-The microphone stays open while the character speaks, so the user can interrupt it; iOS voice processing removes the
-character's voice from what is captured. When the user starts talking, the reply stops and OpenAI is told exactly how
-much of it was heard.
+Barge-in, captions and `send(text:)` work the same as with Yoob voice. The defaults come from Yoob's latency
+measurements:
 
 | Option | Default | Why |
 |---|---|---|
@@ -120,8 +180,6 @@ much of it was heard.
 | `speed` | `1.08` | Natural but snappy |
 
 In a noisy room, raise the server VAD threshold instead of muting the microphone.
-
-Add `NSMicrophoneUsageDescription` to your Info.plist.
 
 ## Talk with it: Gemini Live
 
@@ -226,8 +284,10 @@ This is everything the SDK sends to Yoob:
 | Character files from `cdn.yoob.com` | First use and version updates | Your download grant |
 | `POST api2.yoob.com/api/v1/sessions/heartbeat` | Every 15 s while prepared | Your session token |
 | `POST api2.yoob.com/api/v1/sessions/end` | `close()` | Your session token |
+| `wss://voice.yoob.com/v1/realtime` | Yoob voice conversations | Your voice token, microphone audio, typed text |
 
-Heartbeats are how session time is metered. Call `await avatar.close()` when the character leaves the screen.
+Heartbeats are how session time is metered. With Yoob voice, `voice.yoob.com` relays the conversation to OpenAI and
+meters its minutes. With your own OpenAI account or Gemini, audio goes directly from the device to that provider. Call `await avatar.close()` when the character leaves the screen.
 
 ## Offline and shipped files
 
@@ -244,8 +304,9 @@ directory. Local packs make no network calls.
 
 ## Example
 
-[`Examples/QuickStart`](Examples/QuickStart) is a one-screen app with both characters and a sample greeting (an
-AI-generated voice).
+[`Examples/QuickStart`](Examples/QuickStart) is a one-screen app with both characters, a Talk button that uses Yoob
+voice, and a sample greeting (an AI-generated voice). Run [`Examples/token-server`](Examples/token-server/server.mjs)
+with `YOOB_API_KEY` next to it.
 
 ```sh
 cd Examples/QuickStart && xcodegen generate && open QuickStart.xcodeproj
