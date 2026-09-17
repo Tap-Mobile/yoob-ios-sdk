@@ -16,13 +16,13 @@ Requires iOS 17 or later and Xcode 16 or later. The current preview release is 0
 In Xcode choose **File › Add Package Dependencies…** and enter:
 
 ```
-https://github.com/Tap-Mobile/yoob-ios
+https://github.com/Tap-Mobile/yoob-ios-sdk
 ```
 
 or add it to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Tap-Mobile/yoob-ios", from: "0.1.0")
+.package(url: "https://github.com/Tap-Mobile/yoob-ios-sdk", from: "0.1.0")
 ```
 
 ## Quick start
