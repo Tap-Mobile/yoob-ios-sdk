@@ -11,7 +11,7 @@ own LLM and voice.
 - **Private by design.** Faces render on the device. The SDK sends Yoob only what is listed under [Network](#network):
   conversation audio goes through Yoob only when you use Yoob voice.
 
-Requires iOS 17 or later and Xcode 16 or later. The current preview release is 0.1.0.
+Requires iOS 17 or later and Xcode 16 or later. The current preview release is 0.4.0; see [Changes in 0.4.0](#changes-in-040) if you are upgrading.
 
 ## Install
 
@@ -24,7 +24,7 @@ https://github.com/Yoob-com/yoob-ios-sdk
 or add it to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Yoob-com/yoob-ios-sdk", from: "0.1.0")
+.package(url: "https://github.com/Yoob-com/yoob-ios-sdk", from: "0.4.0")
 ```
 
 ## Quick start
@@ -32,7 +32,8 @@ or add it to `Package.swift`:
 ### 1. Open a session on your backend
 
 Create an API key in the [Yoob console](https://yoob.com/account/). Keep the key on your server; the app gets a
-short-lived session instead:
+short-lived session instead. Your backend checks who is asking, rate-limits them, and asks for exactly the one
+character the app wants (never `"*"`):
 
 ```sh
 curl -X POST https://api2.yoob.com/api/v1/avatar/sessions \
@@ -45,7 +46,9 @@ curl -X POST https://api2.yoob.com/api/v1/avatar/sessions \
 { "session_token": "…", "download_token": "yg1.…", "heartbeat_seconds": 15 }
 ```
 
-[`Examples/token-server`](Examples/token-server/server.mjs) is a complete 30-line backend.
+[`Examples/token-server`](Examples/token-server/server.mjs) is a runnable backend that does all of this. It refuses
+every request until you replace its `requireUser()` with your own sign-in check; for local development, start it with
+`YOOB_EXAMPLE_ALLOW_ANONYMOUS=1`. See [Security](#security).
 
 ### 2. Show the character
 
@@ -66,8 +69,8 @@ struct CharacterScreen: View {
 }
 ```
 
-`prepare()` downloads what is missing and warms up the renderer. The character's poster and idle motion show while the
-models download.
+`prepare()` opens the session, downloads what is missing and warms up the renderer. The character's poster and idle
+motion show while the models download.
 
 ### 3. Make it talk
 
@@ -132,6 +135,10 @@ The `201` response has `voice_session_id`, `voice_token`, `url` (`wss://voice.yo
   device. `voice` is one of `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin` or
   `cedar`, and `instructions` can be up to 8,000 characters. If the backend leaves them out, `options.voice` and
   `options.instructions` are used instead.
+- **Always set them.** Send `voice` and `instructions` from your backend on every voice session; otherwise the app
+  decides what the voice says on your bill.
+- **Voice host.** The SDK connects only to `wss://*.yoob.com` and refuses any other session `url`. To run your own
+  relay, set `options.voiceHosts = ["voice.example.com"]` (`*.example.com` matches subdomains).
 - **Fixed settings.** Yoob sets the model, turn detection, noise reduction, transcription and speed, so those options
   are ignored.
 - **Errors.** When the workspace is out of credit, the API answers `402 {"code": "quota_exceeded"}`, and decoding it
@@ -271,7 +278,15 @@ and an update downloads only the files that changed.
 | `.ready` | Idle and ready to speak. |
 | `.speaking` | Audio is playing and the face follows it. |
 | `.failed(error)` | Loading failed. Call `prepare()` again to resume. |
-| `.stopped(error)` | The session ended, for example `.outOfCredit`. |
+| `.stopped(error)` | The session ended and the character stopped rendering. See below. |
+
+The session stops when the workspace is out of credit (`.outOfCredit`), when Yoob refuses the session
+(`.unauthorized`), or after three heartbeats in a row fail (`.sessionEnded`). The avatar then stops rendering,
+`speak` throws the same error, and `avatar.onSessionEnded` is called. `prepare()` opens a new session.
+
+```swift
+avatar.onSessionEnded = { error in showBanner(error.localizedDescription) }
+```
 
 `avatar.stats` counts frames shown and skipped. `avatar.lastRendererError` says why rendering stopped, if it did.
 
@@ -282,17 +297,32 @@ This is everything the SDK sends to Yoob:
 | Call | When | Contents |
 |---|---|---|
 | Character files from `cdn.yoob.com` | First use and version updates | Your download grant |
-| `POST api2.yoob.com/api/v1/sessions/heartbeat` | Every 15 s while prepared | Your session token |
+| `POST api2.yoob.com/api/v1/sessions/heartbeat` | Every 15 s from the start of `prepare()` | Your session token |
 | `POST api2.yoob.com/api/v1/sessions/end` | `close()` | Your session token |
 | `wss://voice.yoob.com/v1/realtime` | Yoob voice conversations | Your voice token, microphone audio, typed text |
 
 Heartbeats are how session time is metered. With Yoob voice, `voice.yoob.com` relays the conversation to OpenAI and
 meters its minutes. With your own OpenAI account or Gemini, audio goes directly from the device to that provider. Call `await avatar.close()` when the character leaves the screen.
+When the app returns to the foreground, `await avatar.refreshSession()` checks the session at once and opens a new one
+if Yoob ended it while the app was suspended.
 
 ## Offline and shipped files
 
-A complete download is reused offline. To ship a character inside your app instead, use `.local(url)` with a pack
-directory. Local packs make no network calls.
+A complete download is reused when the CDN can't be reached, but `prepare()` still opens a session with your backend,
+and heartbeats must reach Yoob: a character can't run without a metered session.
+
+To ship a character inside your app, save the signed manifest the CDN serves
+(`https://cdn.yoob.com/v1/characters/<id>/<version>.json`, unchanged) as `character.signed.json` next to the files it
+lists, and use `.local`:
+
+```swift
+let pack = Bundle.main.url(forResource: "luna-realistic", withExtension: nil)!
+let avatar = YoobAvatar(.local(pack) { try await MyBackend.yoobSession() })
+```
+
+The SDK verifies the manifest signature against its pinned key and every file's SHA-256 before use, and refuses
+unsigned or modified packs with `YoobError.invalidAssets`. The files load from disk, so the character works without
+the CDN, but the session is opened and metered like a cloud one.
 
 ## Performance
 
@@ -306,11 +336,51 @@ directory. Local packs make no network calls.
 
 [`Examples/QuickStart`](Examples/QuickStart) is a one-screen app with both characters, a Talk button that uses Yoob
 voice, and a sample greeting (an AI-generated voice). Run [`Examples/token-server`](Examples/token-server/server.mjs)
-with `YOOB_API_KEY` next to it.
+next to it:
 
 ```sh
+YOOB_API_KEY=yoob_test_… YOOB_EXAMPLE_ALLOW_ANONYMOUS=1 node Examples/token-server/server.mjs   # 127.0.0.1:3100
 cd Examples/QuickStart && xcodegen generate && open QuickStart.xcodeproj
 ```
+
+`YOOB_EXAMPLE_ALLOW_ANONYMOUS=1` lets anyone who can reach the server mint sessions, so use it only on your own
+machine. Before you deploy a token server, replace `requireUser()` with your own sign-in check.
+
+## Security
+
+- **Keys stay on your server.** A Yoob API key never belongs in an app, a web page or a repository. The API rejects
+  key calls that come from a browser, and an app binary can be taken apart, so keep the key in your server's
+  environment. The app only ever holds a session token, a download grant and a voice token.
+- **Test keys for development.** A `yoob_test_` key opens sandbox sessions that don't use credits. Sandbox mode comes
+  from the key alone; there is no request flag for it.
+- **Grants are short-lived and per character.** A download grant covers the characters its session was opened for and
+  expires soon. Heartbeats may hand the SDK a renewed grant, which it uses from the next download request on. A voice
+  token opens one conversation and must be used within 5 minutes.
+- **Heartbeats are enforced.** They start when `prepare()` opens the session. A refused session (401 or 403), an
+  exhausted workspace (402), or three failed heartbeats in a row stop the character (see [States](#states)).
+  Transient failures are retried with backoff within those three attempts. When Yoob ends a session that went quiet
+  (an app suspended in the background), the SDK asks your `credentials` closure for a new one.
+- **Signed packs only.** Downloaded and shipped packs must carry a manifest signed by Yoob, and every file is checked
+  against it.
+- **Voice only goes to Yoob.** Yoob voice connects only to `wss://*.yoob.com` unless you set `voiceHosts`.
+- **What your token server must do.** The example server does each of these; keep them when you write your own:
+  1. Authenticate the user before minting anything, and fail closed.
+  2. Rate-limit sessions per user.
+  3. Accept only the character ids you offer, and send exactly that one character. Never `"*"`.
+  4. Always set the voice and instructions for voice sessions on the server.
+  5. Build the request body yourself. Don't pass fields from the app through to Yoob.
+  6. Keep the key in the server's environment, and return Yoob's response without logging tokens.
+
+## Changes in 0.4.0
+
+- `.local(url)` is now `.local(url, credentials:)`. Local packs need `character.signed.json` and a metered session.
+- Heartbeats start with `prepare()` and are enforced. New `YoobError.sessionEnded`, `avatar.onSessionEnded` and
+  `avatar.refreshSession()`.
+- Heartbeat replies may carry a renewed download grant (`grant`, `grant_expires_at`); older replies still work.
+- Yoob voice connects only to `wss://*.yoob.com` unless `YoobConversation.Options.voiceHosts` says otherwise.
+- The example token server fails closed without auth, allowlists characters (`YOOB_CHARACTERS`, default
+  `luna-realistic,luna-anime`), rate-limits each user, always pins the voice prompt, and never passes request fields
+  such as `is_sandbox` through.
 
 ## License
 

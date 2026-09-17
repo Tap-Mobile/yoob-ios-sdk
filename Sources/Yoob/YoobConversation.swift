@@ -33,8 +33,14 @@ public final class YoobConversation {
         public var transcriptionModel: String? = "gpt-4o-mini-transcribe"
         /// Have the character speak first.
         public var greet = false
+        /// Hosts a Yoob voice session may connect to. The default, `*.yoob.com`, refuses a session `url` anywhere
+        /// else, so a compromised or misconfigured backend can't send microphone audio elsewhere. Change it only to
+        /// self-host the relay, for example `["voice.example.com"]`. `*.` matches any subdomain; only `wss` is allowed.
+        public var voiceHosts: [String] = YoobConversation.defaultVoiceHosts
         public init() {}
     }
+
+    public nonisolated static let defaultVoiceHosts = ["*.yoob.com"]
 
     public private(set) var state: State = .idle
     /// What the user is saying (final once the turn is transcribed).
@@ -127,7 +133,7 @@ public final class YoobConversation {
         switch connection {
         case .yoob(let voiceSession):
             // A voice session opens one connection and can't be refreshed, so it is fetched right before connecting.
-            request = try Self.request(for: try await voiceSession())
+            request = try Self.request(for: try await voiceSession(), allowedHosts: options.voiceHosts)
         case .openAI(let clientSecret):
             let secret = try await clientSecret()
             var components = URLComponents(string: "wss://api.openai.com/v1/realtime")!
@@ -262,14 +268,33 @@ public final class YoobConversation {
     }
 
     /// The Yoob voice connection: the grant rides in the Authorization header.
-    static func request(for session: YoobVoiceSession) throws -> URLRequest {
+    static func request(for session: YoobVoiceSession, allowedHosts: [String] = defaultVoiceHosts) throws -> URLRequest {
         guard session.url.scheme?.lowercased() == "wss" else {
             throw YoobError.voiceSession(code: 0, message: "The voice session URL must use wss://.")
+        }
+        guard isAllowedVoiceURL(session.url, hosts: allowedHosts) else {
+            throw YoobError.voiceSession(code: 0, message:
+                "The voice session URL isn't on an allowed host. Yoob voice runs on *.yoob.com; set voiceHosts to self-host.")
         }
         var request = URLRequest(url: session.url)
         request.setValue("Bearer \(session.voiceToken)", forHTTPHeaderField: "Authorization")
         request.setValue("realtime", forHTTPHeaderField: "Sec-WebSocket-Protocol")
         return request
+    }
+
+    /// Whether `url` is a `wss` URL on one of `hosts` (exact names, or `*.domain` for any subdomain of it).
+    nonisolated static func isAllowedVoiceURL(_ url: URL, hosts: [String]) -> Bool {
+        guard url.scheme?.lowercased() == "wss", url.user == nil, url.password == nil,
+              var host = url.host?.lowercased(), !host.isEmpty else { return false }
+        if host.hasSuffix(".") { host.removeLast() }
+        return hosts.contains { entry in
+            let pattern = entry.trimmingCharacters(in: .whitespaces).lowercased()
+            if pattern.hasPrefix("*.") {
+                let domain = pattern.dropFirst(2)
+                return !domain.isEmpty && host.hasSuffix("." + domain)
+            }
+            return !pattern.isEmpty && host == pattern
+        }
     }
 
     /// Yoob voice configures the session itself. The relay accepts only instructions and voice from the app, and only

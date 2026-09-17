@@ -57,7 +57,7 @@ final class ConversationTests: XCTestCase {
     private func yoobConversation(_ options: YoobConversation.Options = .init(),
                                   session: YoobVoiceSession = ConversationTests.session)
         -> (YoobConversation, RelayFakeSocket, RequestBox) {
-        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent")))
+        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent"), credentials: { throw YoobError.unauthorized }))
         let socket = RelayFakeSocket()
         let box = RequestBox()
         let conversation = YoobConversation(avatar: avatar, options: options, voiceSession: { session }) { request in
@@ -105,7 +105,7 @@ final class ConversationTests: XCTestCase {
     }
 
     func testOpenAIStillSendsTheFullSession() async throws {
-        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent")))
+        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent"), credentials: { throw YoobError.unauthorized }))
         let socket = RelayFakeSocket()
         let box = RequestBox()
         let conversation = YoobConversation(avatar: avatar, options: .init(), clientSecret: { "ek_test" }) {
@@ -201,7 +201,7 @@ final class ConversationTests: XCTestCase {
     }
 
     func testBothInitializersWorkWithTrailingClosures() {
-        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent")))
+        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent"), credentials: { throw YoobError.unauthorized }))
         let openAI = YoobConversation(avatar: avatar) { "ek" }
         let yoob = YoobConversation(avatar: avatar) { ConversationTests.session }
         XCTAssertEqual(openAI.state, .idle)
@@ -209,7 +209,7 @@ final class ConversationTests: XCTestCase {
     }
 
     func testCancelledRepliesAreIgnoredAndBargeInTruncates() {
-        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent")))
+        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent"), credentials: { throw YoobError.unauthorized }))
         let conversation = YoobConversation(avatar: avatar, options: .init(), clientSecret: { "ek" }) { _ in FakeSocket() }
         let socket = FakeSocket()
         conversation.attach(socket)
@@ -235,7 +235,7 @@ final class ConversationTests: XCTestCase {
     }
 
     func testTypedTextStartsAReply() {
-        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent")))
+        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent"), credentials: { throw YoobError.unauthorized }))
         let conversation = YoobConversation(avatar: avatar, options: .init(), clientSecret: { "ek" }) { _ in FakeSocket() }
         let socket = FakeSocket()
         conversation.attach(socket)

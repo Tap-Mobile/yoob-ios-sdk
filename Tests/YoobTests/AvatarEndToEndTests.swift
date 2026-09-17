@@ -14,7 +14,10 @@ final class AvatarEndToEndTests: XCTestCase {
             throw XCTSkip("set YOOB_LOCAL_PACKS and YOOB_SPEECH_PCM")
         }
         let pcm = try Data(contentsOf: URL(fileURLWithPath: speech))
-        let avatar = YoobAvatar(.local(URL(fileURLWithPath: packs).appendingPathComponent(character)))
+        setenv("YOOB_ALLOW_UNSIGNED_PACKS", "1", 1)  // development packs carry a plain character.json
+        // A sandbox session token meters the run; a placeholder works too, since the test ends before the first beat.
+        let session = YoobCredentials(sessionToken: env["YOOB_SESSION_TOKEN"] ?? "local-test", downloadToken: "unused")
+        let avatar = YoobAvatar(.local(URL(fileURLWithPath: packs).appendingPathComponent(character), credentials: { session }))
         try await avatar.prepare()
         XCTAssertEqual(avatar.phase, .ready)
         XCTAssertNotNil(avatar.poster)
