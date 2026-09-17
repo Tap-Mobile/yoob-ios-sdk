@@ -65,6 +65,8 @@ public final class YoobAvatar {
     private var packDirectory: URL?
     private var preparing: Task<Void, Error>?
     private let player = SpeechPlayer()
+    /// The user's microphone: input choice, mute and level, captured with echo cancellation.
+    @ObservationIgnored public private(set) lazy var microphone = YoobMicrophone(player: player)
     private var utterance: Utterance?
     private var heartbeat: Task<Void, Never>?
     /// Call frame the head reached; the next utterance continues from there.
@@ -374,6 +376,7 @@ public final class YoobAvatar {
     /// Ends the metered session and releases the renderer. The downloaded files stay cached.
     public func close() async {
         interrupt()
+        microphone.stop()
         heartbeat?.cancel(); heartbeat = nil
         player.shutdown()
         engine = nil

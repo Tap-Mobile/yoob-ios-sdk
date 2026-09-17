@@ -25,6 +25,10 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Luna listens while you talk to her.</string>
+	<key>OpenAISecretURL</key>
+	<string>http://localhost:3100/openai-secret</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

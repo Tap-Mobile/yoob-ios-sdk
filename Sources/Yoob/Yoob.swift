@@ -23,6 +23,8 @@ public enum YoobError: Error, LocalizedError, Equatable {
     case invalidAudio(String)
     /// The renderer stopped. Audio keeps playing; the idle face stays on screen.
     case renderer(String)
+    /// The user hasn't allowed microphone access.
+    case permissionDenied(String)
 
     public var errorDescription: String? {
         switch self {
@@ -33,6 +35,7 @@ public enum YoobError: Error, LocalizedError, Equatable {
         case .unsupported(let detail): "This character can't run here: \(detail)."
         case .invalidAudio(let detail): "Yoob can't use this audio: \(detail)."
         case .renderer(let detail): "The character renderer stopped: \(detail)."
+        case .permissionDenied(let detail): detail
         }
     }
 }

@@ -41,6 +41,7 @@ final class SpeechPlayer: @unchecked Sendable {
             guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false) else {
                 throw YoobError.invalidAudio("sample rate \(sampleRate)")
             }
+            if capture == nil { try Self.activatePlaybackSession() }
             engine.stop()
             engine.disconnectNodeOutput(player)
             engine.connect(player, to: engine.mainMixerNode, format: format)
@@ -49,6 +50,148 @@ final class SpeechPlayer: @unchecked Sendable {
             do { try engine.start() } catch { throw YoobError.renderer("audio output: \(error.localizedDescription)") }
         }
         finishedSamples = 0; queued = []; runBase = 0; running = false
+    }
+
+    // MARK: - Microphone
+
+    /// Called on the audio thread with 24 kHz mono PCM16 and its RMS level (0–1).
+    typealias CaptureHandler = @Sendable (Data, Double) -> Void
+    private var capture: (handler: CaptureHandler, sink: AVAudioSinkNode, clock: AVAudioSourceNode)?
+    private var configurationObserver: NSObjectProtocol?
+    var onCaptureFailed: (@Sendable (String) -> Void)?
+
+    var isCapturing: Bool { lock.withLock { capture != nil } }
+
+    /// Captures the microphone through the same engine that plays speech, with voice processing on, so the system echo
+    /// canceller removes the character's voice from what is captured.
+    func startCapture(_ handler: @escaping CaptureHandler) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard capture == nil else { return }
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
+            try session.setActive(true)
+        } catch { throw YoobError.renderer("audio session: \(error.localizedDescription)") }
+        #endif
+        engine.stop()
+        do { try engine.inputNode.setVoiceProcessingEnabled(true) }
+        catch { throw YoobError.unsupported("echo cancellation is unavailable: \(error.localizedDescription)") }
+        let output = format ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
+        if format == nil {
+            engine.disconnectNodeOutput(player)
+            engine.connect(player, to: engine.mainMixerNode, format: output)
+            format = output
+        }
+        // Keeps the voice-processing graph rendering between replies: speaker silence, never fake microphone input.
+        let clock = AVAudioSourceNode(format: output) { @Sendable isSilence, _, _, buffers in
+            isSilence.pointee = true
+            for buffer in UnsafeMutableAudioBufferListPointer(buffers) {
+                if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+            }
+            return noErr
+        }
+        engine.attach(clock)
+        engine.connect(clock, to: engine.mainMixerNode, format: output)
+        let sink = try makeSink(handler)
+        capture = (handler, sink, clock)
+        engine.prepare()
+        do { try engine.start() } catch {
+            teardownCapture()
+            throw YoobError.renderer("microphone: \(error.localizedDescription)")
+        }
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            // The system stops the engine when the hardware format changes (for example a headset connecting).
+            self?.control.async { self?.recoverCapture() }
+        }
+    }
+
+    func stopCapture() {
+        lock.lock(); defer { lock.unlock() }
+        guard capture != nil else { return }
+        engine.stop()
+        teardownCapture()
+        try? engine.inputNode.setVoiceProcessingEnabled(false)
+        if let format { engine.disconnectNodeOutput(player); engine.connect(player, to: engine.mainMixerNode, format: format) }
+        #if os(iOS)
+        try? Self.activatePlaybackSession(force: true)
+        #endif
+        engine.prepare()
+        try? engine.start()
+    }
+
+    func setInputMuted(_ muted: Bool) {
+        engine.inputNode.isVoiceProcessingInputMuted = muted
+    }
+
+    private func teardownCapture() {
+        if let observer = configurationObserver { NotificationCenter.default.removeObserver(observer) }
+        configurationObserver = nil
+        if let capture {
+            engine.disconnectNodeOutput(engine.inputNode)
+            engine.detach(capture.sink)
+            engine.detach(capture.clock)
+        }
+        capture = nil
+    }
+
+    private func recoverCapture() {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = capture, !engine.isRunning else { return }
+        engine.disconnectNodeOutput(engine.inputNode)
+        engine.detach(current.sink)
+        do {
+            let sink = try makeSink(current.handler)
+            capture = (current.handler, sink, current.clock)
+            engine.prepare()
+            try engine.start()
+        } catch {
+            onCaptureFailed?("The microphone stopped after an audio route change.")
+        }
+    }
+
+    /// Builds the capture sink for the input's current hardware format. Caller holds the lock.
+    private func makeSink(_ handler: @escaping CaptureHandler) throws -> AVAudioSinkNode {
+        let input = engine.inputNode, source = input.outputFormat(forBus: 0)
+        guard source.sampleRate > 0, source.channelCount > 0,
+              let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: source, to: target) else {
+            throw YoobError.unsupported("no microphone input is available")
+        }
+        converter.primeMethod = .none
+        // A sink node reads the input in its realtime receiver; a tap can stop firing on the voice-processing graph.
+        let sink = AVAudioSinkNode { @Sendable _, frames, buffers in
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: source, bufferListNoCopy: buffers, deallocator: nil) else { return noErr }
+            buffer.frameLength = frames
+            let capacity = AVAudioFrameCount(ceil(Double(frames) * 24000 / source.sampleRate)) + 32
+            guard let converted = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return noErr }
+            var supplied = false, error: NSError?
+            let status = converter.convert(to: converted, error: &error) { _, state in
+                if supplied { state.pointee = .noDataNow; return nil }
+                supplied = true; state.pointee = .haveData; return buffer
+            }
+            guard status != .error, error == nil, converted.frameLength > 0, let samples = converted.int16ChannelData?[0] else { return noErr }
+            var sum = 0.0
+            for i in 0..<Int(converted.frameLength) { let value = Double(samples[i]) / 32768; sum += value * value }
+            handler(Data(bytes: samples, count: Int(converted.frameLength) * 2), sqrt(sum / Double(converted.frameLength)))
+            return noErr
+        }
+        engine.attach(sink)
+        engine.connect(input, to: sink, format: source)
+        return sink
+    }
+
+    /// Plays through the speaker and respects the ring/silent switch the way spoken audio should, unless the app has
+    /// already chosen a category of its own.
+    private static func activatePlaybackSession(force: Bool = false) throws {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        guard force || session.category == .soloAmbient else { return }
+        try session.setCategory(.playback, mode: .spokenAudio)
+        try session.setActive(true)
+        #endif
     }
 
     func schedule(_ pcm: Data) {

@@ -28,5 +28,8 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         # Your backend's endpoint that returns a Yoob session (see Examples/token-server).
         YoobTokenURL: http://localhost:3100/yoob-session
+        # Your backend's endpoint that returns an OpenAI Realtime client secret, for Talk.
+        OpenAISecretURL: http://localhost:3100/openai-secret
+        NSMicrophoneUsageDescription: Luna listens while you talk to her.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
