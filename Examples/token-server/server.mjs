@@ -3,7 +3,9 @@
 //   YOOB_API_KEY=yoob_live_... [OPENAI_API_KEY=sk-...] node server.mjs
 //
 // POST /yoob-session   → a Yoob session (character downloads and metering)
-// POST /openai-secret  → an OpenAI Realtime client secret, for YoobConversation (only if OPENAI_API_KEY is set)
+// POST /yoob-voice     → a Yoob voice session, for YoobConversation (no provider key; minutes billed to your workspace)
+// POST /openai-secret  → an OpenAI Realtime client secret, for YoobConversation with your own OpenAI account
+//                        (only if OPENAI_API_KEY is set)
 //
 // In your own backend, check who the user is first: every session is metered to your workspace.
 import http from "node:http";
@@ -12,6 +14,13 @@ const apiKey = process.env.YOOB_API_KEY;
 const apiBase = process.env.YOOB_API_BASE ?? "https://api2.yoob.com";
 const port = Number(process.env.PORT ?? 3100);
 if (!apiKey) throw new Error("Set YOOB_API_KEY");
+
+// Each character's voice and prompt are set here, on the server: the page can't change them and never sees the prompt.
+const LUNA = {
+  voice: "marin",
+  instructions: "You are Luna, a warm, curious companion. Keep replies short and natural.",
+};
+const CHARACTERS = { "luna-anime": LUNA, "luna-realistic": LUNA };
 
 async function forward(res, upstream) {
   res.writeHead(upstream.status, { "content-type": "application/json" });
@@ -27,6 +36,15 @@ http.createServer(async (req, res) => {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify({ characters: character ? [character] : ["*"] }),
+    }));
+  }
+  if (req.method === "POST" && req.url === "/yoob-voice") {
+    const { character } = JSON.parse(body || "{}");
+    // The voice token must be used within 5 minutes and opens one conversation: mint it when the user taps Talk.
+    return forward(res, await fetch(`${apiBase}/api/v1/voice/sessions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ ...(CHARACTERS[character] ?? {}), max_seconds: 900 }),
     }));
   }
   if (req.method === "POST" && req.url === "/openai-secret") {

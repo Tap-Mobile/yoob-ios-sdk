@@ -25,6 +25,9 @@ public enum YoobError: Error, LocalizedError, Equatable {
     case renderer(String)
     /// The user hasn't allowed microphone access.
     case permissionDenied(String)
+    /// Yoob voice ended or refused the conversation. `code` is the WebSocket close code (for example 4009 when the
+    /// session reached its time limit); `message` can be shown to the user.
+    case voiceSession(code: Int, message: String)
 
     public var errorDescription: String? {
         switch self {
@@ -36,7 +39,28 @@ public enum YoobError: Error, LocalizedError, Equatable {
         case .invalidAudio(let detail): "Yoob can't use this audio: \(detail)."
         case .renderer(let detail): "The character renderer stopped: \(detail)."
         case .permissionDenied(let detail): detail
+        case .voiceSession(_, let message): message
         }
+    }
+}
+
+extension YoobError {
+    /// What a Yoob voice relay close code means to the person using the app.
+    static func voiceClosed(code: Int) -> YoobError {
+        let message = switch code {
+        case 1011: "The voice service disconnected. Start the conversation again."
+        case 1013: "Voice is busy right now. Try again in a moment."
+        case 4000: "The voice service refused this app's request. Update the app and try again."
+        case 4001: "The voice session was refused. Start the conversation again."
+        case 4002: "The voice session expired before it connected. Start the conversation again."
+        case 4003: "This voice session was already used. Start the conversation again."
+        case 4008: "This conversation reached its usage limit."
+        case 4009: "This conversation reached its time limit."
+        case 4010: "The conversation ended because it was idle for too long."
+        case 4029: "Voice has reached its usage limit for now. Try again later."
+        default: "The conversation disconnected (\(code))."
+        }
+        return .voiceSession(code: code, message: message)
     }
 }
 

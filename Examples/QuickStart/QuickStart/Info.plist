@@ -37,5 +37,7 @@
 	</array>
 	<key>YoobTokenURL</key>
 	<string>http://localhost:3100/yoob-session</string>
+	<key>YoobVoiceURL</key>
+	<string>http://localhost:3100/yoob-voice</string>
 </dict>
 </plist>
