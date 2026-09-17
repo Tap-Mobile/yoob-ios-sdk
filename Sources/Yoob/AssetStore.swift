@@ -8,6 +8,24 @@ public struct YoobProgress: Sendable, Equatable {
     public var fraction: Double { totalBytes == 0 ? 0 : Double(completedBytes) / Double(totalBytes) }
 }
 
+/// Where downloads come from, and the grant that authorizes them. The grant is read before every request, so one a
+/// heartbeat renews is used from the next request on.
+final class CDNAccess: @unchecked Sendable {
+    let cdnBase: URL
+    private let lock = NSLock()
+    private var token: String
+
+    init(cdnBase: URL, downloadToken: String) { self.cdnBase = cdnBase; token = downloadToken }
+    convenience init(_ credentials: YoobCredentials) {
+        self.init(cdnBase: credentials.cdnBase, downloadToken: credentials.downloadToken)
+    }
+
+    var downloadToken: String {
+        get { lock.withLock { token } }
+        set { lock.withLock { token = newValue } }
+    }
+}
+
 /// Downloads character packs from the CDN in content-addressed chunks, verifies every chunk and file, and keeps them in
 /// Application Support (excluded from backup). An interrupted download resumes at the last verified chunk; a new version
 /// reuses unchanged chunks that are still on disk.
@@ -41,7 +59,8 @@ actor AssetStore {
             throw YoobError.unsupported("character id \(character)")
         }
         let url = credentials.cdnBase.appendingPathComponent("v1/characters/\(character)/\(version ?? "latest").json")
-        let data = try await fetch(url, token: credentials.downloadToken, limit: 4 << 20)
+        let token = credentials.downloadToken
+        let data = try await fetch(url, token: { token }, limit: 4 << 20)
         let envelope: SignedManifest
         do { envelope = try JSONDecoder().decode(SignedManifest.self, from: data) }
         catch { throw YoobError.invalidAssets("manifest envelope") }
@@ -77,6 +96,11 @@ actor AssetStore {
     /// Downloads every file whose tier is at most `throughTier`. Files already verified are skipped.
     func download(_ manifest: CharacterManifest, throughTier: Int, credentials: YoobCredentials,
                   progress: @escaping @Sendable (YoobProgress) -> Void) async throws -> URL {
+        try await download(manifest, throughTier: throughTier, access: CDNAccess(credentials), progress: progress)
+    }
+
+    func download(_ manifest: CharacterManifest, throughTier: Int, access: CDNAccess,
+                  progress: @escaping @Sendable (YoobProgress) -> Void) async throws -> URL {
         let directory = packDirectory(manifest)
         inUse.insert(directory.path)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -99,7 +123,7 @@ actor AssetStore {
             func enqueue() {
                 guard let file = queue.next() else { return }
                 group.addTask {
-                    try await self.download(file, into: directory, credentials: credentials) { bytes in
+                    try await self.download(file, into: directory, access: access) { bytes in
                         counter.add(bytes)
                     }
                 }
@@ -114,7 +138,7 @@ actor AssetStore {
         return directory
     }
 
-    private func download(_ file: CharacterManifest.File, into directory: URL, credentials: YoobCredentials,
+    private func download(_ file: CharacterManifest.File, into directory: URL, access: CDNAccess,
                           counted: @escaping @Sendable (Int) -> Void) async throws {
         let key = directory.appendingPathComponent(file.path).path
         if let running = inFlight[key] {
@@ -122,13 +146,13 @@ actor AssetStore {
             counted(file.size)
             return
         }
-        let task = Task { try await self.fetchFile(file, into: directory, credentials: credentials, counted: counted) }
+        let task = Task { try await self.fetchFile(file, into: directory, access: access, counted: counted) }
         inFlight[key] = task
         defer { inFlight[key] = nil }
         try await task.value
     }
 
-    private func fetchFile(_ file: CharacterManifest.File, into directory: URL, credentials: YoobCredentials,
+    private func fetchFile(_ file: CharacterManifest.File, into directory: URL, access: CDNAccess,
                            counted: @Sendable (Int) -> Void) async throws {
         let destination = directory.appendingPathComponent(file.path)
         let partial = destination.appendingPathExtension("part")
@@ -152,9 +176,9 @@ actor AssetStore {
             func enqueue() {
                 guard let index = queue.next() else { return }
                 let chunk = file.chunks[index]
-                let url = credentials.cdnBase.appendingPathComponent("v1/chunks/\(chunk.sha256)")
+                let url = access.cdnBase.appendingPathComponent("v1/chunks/\(chunk.sha256)")
                 group.addTask {
-                    let data = try await Self.fetch(url, token: credentials.downloadToken, limit: chunk.size, session: session)
+                    let data = try await Self.fetch(url, token: { access.downloadToken }, limit: chunk.size, session: session)
                     guard data.count == chunk.size, Hex.string(SHA256.hash(data: data)) == chunk.sha256 else {
                         throw YoobError.invalidAssets("chunk \(chunk.sha256.prefix(12))")
                     }
@@ -220,17 +244,18 @@ actor AssetStore {
 
     func release(_ directory: URL) { inUse.remove(directory.path) }
 
-    private func fetch(_ url: URL, token: String, limit: Int) async throws -> Data {
+    private func fetch(_ url: URL, token: @escaping @Sendable () -> String, limit: Int) async throws -> Data {
         try await Self.fetch(url, token: token, limit: limit, session: session)
     }
 
-    static func fetch(_ url: URL, token: String, limit: Int, session: URLSession) async throws -> Data {
+    /// `token` is read before every attempt, so a renewed grant is used on the next retry.
+    static func fetch(_ url: URL, token: @Sendable () -> String, limit: Int, session: URLSession) async throws -> Data {
         var request = URLRequest(url: url)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("yoob-ios/\(Yoob.version)", forHTTPHeaderField: "X-Yoob-SDK")
         var lastError: Error?
         for attempt in 0..<4 {
             if attempt > 0 { try await Task.sleep(for: .milliseconds(400 << attempt)) }
+            request.setValue("Bearer \(token())", forHTTPHeaderField: "Authorization")
             do {
                 let (data, response) = try await session.data(for: request)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0

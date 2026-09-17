@@ -41,7 +41,7 @@ final class GeminiFakeSocket: RealtimeSocket, @unchecked Sendable {
 final class GeminiConversationTests: XCTestCase {
     private func makeConversation(_ options: YoobGeminiConversation.Options = .init(),
                                   socket: GeminiFakeSocket = GeminiFakeSocket()) -> YoobGeminiConversation {
-        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent")))
+        let avatar = YoobAvatar(.local(URL(fileURLWithPath: "/nonexistent"), credentials: { throw YoobError.unauthorized }))
         return YoobGeminiConversation(avatar: avatar, options: options, token: { "t" }) { _ in socket }
     }
 

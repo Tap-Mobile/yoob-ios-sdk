@@ -2,7 +2,7 @@ import Foundation
 
 /// Yoob renders a talking character on the device from any speech audio.
 public enum Yoob {
-    public static let version = "0.1.0"
+    public static let version = "0.4.0"
 
     /// Removes every downloaded character except the versions currently loaded.
     public static func clearCache() async throws { try await AssetStore.shared.clear() }
@@ -25,6 +25,9 @@ public enum YoobError: Error, LocalizedError, Equatable {
     case renderer(String)
     /// The user hasn't allowed microphone access.
     case permissionDenied(String)
+    /// The session can't continue (heartbeats kept failing, or Yoob ended it and a new one couldn't be opened), so the
+    /// character stopped rendering. Call `prepare()` to start a new session.
+    case sessionEnded(String)
     /// Yoob voice ended or refused the conversation. `code` is the WebSocket close code (for example 4009 when the
     /// session reached its time limit); `message` can be shown to the user.
     case voiceSession(code: Int, message: String)
@@ -39,6 +42,7 @@ public enum YoobError: Error, LocalizedError, Equatable {
         case .invalidAudio(let detail): "Yoob can't use this audio: \(detail)."
         case .renderer(let detail): "The character renderer stopped: \(detail)."
         case .permissionDenied(let detail): detail
+        case .sessionEnded(let detail): "The Yoob session ended: \(detail)."
         case .voiceSession(_, let message): message
         }
     }
@@ -75,6 +79,12 @@ public struct YoobCredentials: Sendable, Decodable, Equatable {
     public let apiBase: URL
     public let cdnBase: URL
 
+    /// The same session with a download grant renewed by a heartbeat.
+    func renewingGrant(_ downloadToken: String) -> YoobCredentials {
+        YoobCredentials(sessionToken: sessionToken, downloadToken: downloadToken, heartbeatSeconds: heartbeatSeconds,
+                        apiBase: apiBase, cdnBase: cdnBase)
+    }
+
     public init(sessionToken: String, downloadToken: String, heartbeatSeconds: Int = 30,
                 apiBase: URL = URL(string: "https://api2.yoob.com")!, cdnBase: URL = URL(string: "https://cdn.yoob.com")!) {
         self.sessionToken = sessionToken; self.downloadToken = downloadToken
@@ -95,11 +105,14 @@ public struct YoobCredentials: Sendable, Decodable, Equatable {
     }
 }
 
-/// Where a character's files come from.
+/// Where a character's files come from. Either way, the avatar opens a metered session with `credentials` and sends
+/// heartbeats while it is prepared.
 public enum YoobSource: Sendable {
-    /// Download from the Yoob CDN with credentials from your backend. Sessions are metered.
+    /// Download from the Yoob CDN with credentials from your backend.
     case cloud(character: String, credentials: @Sendable () async throws -> YoobCredentials)
-    /// A pack already on disk (a manifest.json plus its files), for apps that ship the files themselves and for
-    /// development. No network calls, no metering.
-    case local(URL)
+    /// A pack your app ships: a directory with the signed manifest the CDN serves, saved as `character.signed.json`
+    /// (from `https://cdn.yoob.com/v1/characters/<id>/<version>.json`), and the files it lists. The signature and every
+    /// file's checksum are verified before use; unsigned or modified packs are refused. Files load from disk, but the
+    /// session is still opened and metered through `credentials`.
+    case local(URL, credentials: @Sendable () async throws -> YoobCredentials)
 }

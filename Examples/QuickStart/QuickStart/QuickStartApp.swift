@@ -18,7 +18,12 @@ enum Backend {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(["character": character])
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw YoobError.unauthorized }
+        guard let status = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(status) else {
+            // The example token server explains refusals, for example that it needs YOOB_EXAMPLE_ALLOW_ANONYMOUS=1.
+            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            print("Yoob token server refused the session: \(body?["error"] as? String ?? "no details")")
+            throw YoobError.unauthorized
+        }
         return try JSONDecoder().decode(YoobCredentials.self, from: data)
     }
 

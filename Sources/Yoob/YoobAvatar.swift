@@ -24,7 +24,8 @@ public final class YoobAvatar {
         case speaking
         /// Preparing failed. `prepare()` can be called again.
         case failed(YoobError)
-        /// The session was stopped, for example because the workspace ran out of credit.
+        /// The session ended and the character stopped rendering: `.outOfCredit`, `.unauthorized`, or `.sessionEnded`
+        /// after heartbeats kept failing. `prepare()` starts a new session.
         case stopped(YoobError)
     }
 
@@ -45,6 +46,9 @@ public final class YoobAvatar {
         if case .cloud(let character, _) = source { return character }
         return manifest?.character
     }
+    /// Called when the session ends and the character stops rendering, with the same error `phase` holds in
+    /// `.stopped`: `.outOfCredit`, `.unauthorized`, or `.sessionEnded`.
+    @ObservationIgnored public var onSessionEnded: (@MainActor (YoobError) -> Void)?
     /// Sync diagnostics: frames shown and frames skipped because rendering fell behind the audio.
     public private(set) var stats = Stats()
     /// Why the renderer stopped during the last utterance, if it did. The audio kept playing.
@@ -68,7 +72,8 @@ public final class YoobAvatar {
     /// The user's microphone: input choice, mute and level, captured with echo cancellation.
     @ObservationIgnored public private(set) lazy var microphone = YoobMicrophone(player: player)
     private var utterance: Utterance?
-    private var heartbeat: Task<Void, Never>?
+    private var heartbeat: SessionHeartbeat?
+    private var access: CDNAccess?
     /// Call frame the head reached; the next utterance continues from there.
     private var hostFrame = 0
     private var externalClock = false
@@ -120,51 +125,70 @@ public final class YoobAvatar {
             if let known = error as? YoobError { failure = known }
             else if error is CocoaError || error is URLError { failure = .network(error.localizedDescription) }
             else { failure = .renderer(error.localizedDescription) }
+            if case .stopped(let reason) = phase { throw reason } // already reported
+            // Don't leave a metered session running behind a failed start.
+            await endSession()
             if !(error is CancellationError) { phase = .failed(failure) }
             throw failure
         }
     }
 
     private func load() async throws {
+        await endSession()
         let manifest: CharacterManifest
         let root: URL
+        let fetchCredentials: @Sendable () async throws -> YoobCredentials
         switch source {
-        case .local(let directory):
-            let data: Data
-            do { data = try Data(contentsOf: directory.appendingPathComponent("character.json")) }
-            catch { throw YoobError.invalidAssets("character.json missing in \(directory.lastPathComponent)") }
-            manifest = try JSONDecoder().decode(CharacterManifest.self, from: data)
-            try manifest.validate()
+        case .local(_, let credentials), .cloud(_, let credentials): fetchCredentials = credentials
+        }
+        // Every start opens a metered session first, and heartbeats run from here on, during the download too.
+        phase = .downloading(YoobProgress(completedBytes: 0, totalBytes: 0))
+        let credentials = try await fetchCredentials()
+        self.credentials = credentials
+        let access = CDNAccess(credentials)
+        self.access = access
+        startHeartbeat()
+        switch source {
+        case .local(let directory, _):
+            manifest = try await LocalPack.open(directory)
             root = directory
+            try checkRunning()
             show(manifest: manifest, root: root)
-        case .cloud(let character, let fetchCredentials):
-            phase = .downloading(YoobProgress(completedBytes: 0, totalBytes: 0))
-            let credentials = try await fetchCredentials()
-            self.credentials = credentials
+        case .cloud(let character, _):
             let store = AssetStore.shared
             do {
                 manifest = try await store.manifest(character: character, version: version, credentials: credentials)
             } catch let error as YoobError {
-                // Offline with a complete pack on disk: start from it.
+                // Offline with a complete pack on disk: start from it. The session above is still required.
                 guard case .network = error, version == nil, let cached = await store.cachedManifest(character: character) else { throw error }
                 manifest = cached
             }
-            let progress: @Sendable (YoobProgress) -> Void = { value in
-                Task { @MainActor [weak self] in
+            try checkRunning()
+            let progress: @Sendable (YoobProgress) -> Void = { [weak self] value in
+                Task { @MainActor in
                     guard let self, case .downloading = self.phase else { return }
                     self.phase = .downloading(value)
                 }
             }
             // The poster and idle frames first, so the character is on screen while the models download.
-            let early = try await store.download(manifest, throughTier: 1, credentials: credentials, progress: { _ in })
+            let early = try await store.download(manifest, throughTier: 1, access: access, progress: { _ in })
+            try checkRunning()
             show(manifest: manifest, root: early)
-            root = try await store.download(manifest, throughTier: 3, credentials: credentials, progress: progress)
-            startHeartbeat()
+            root = try await store.download(manifest, throughTier: 3, access: access, progress: progress)
         }
+        try checkRunning()
         packDirectory = root
         phase = .warming
-        engine = try await FaceEngines.load(manifest, root: root)
+        let engine = try await FaceEngines.load(manifest, root: root)
+        try checkRunning()
+        self.engine = engine
         phase = .ready
+    }
+
+    /// Throws when the session ended while starting.
+    private func checkRunning() throws {
+        if case .stopped(let reason) = phase { throw reason }
+        guard heartbeat?.isRunning == true else { throw YoobError.sessionEnded("the session stopped while starting") }
     }
 
     private func show(manifest: CharacterManifest, root: URL) {
@@ -377,79 +401,68 @@ public final class YoobAvatar {
     public func close() async {
         interrupt()
         microphone.stop()
-        heartbeat?.cancel(); heartbeat = nil
         player.shutdown()
         engine = nil
         if let packDirectory { await AssetStore.shared.release(packDirectory) }
-        if let credentials { _ = try? await SessionAPI.post("end", credentials: credentials) }
-        credentials = nil
+        packDirectory = nil
+        await endSession()
         phase = .notPrepared
     }
 
-    private func startHeartbeat() {
-        heartbeat?.cancel()
-        heartbeat = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let seconds = self?.credentials?.heartbeatSeconds else { return }
-                try? await Task.sleep(for: .seconds(seconds))
-                guard !Task.isCancelled, let self else { return }
-                await self.beat()
-            }
-        }
+    /// Stops heartbeats and ends the current session on the API, best effort.
+    private func endSession() async {
+        heartbeat?.stop(); heartbeat = nil
+        guard let credentials else { return }
+        self.credentials = nil
+        await SessionAPI.end(credentials)
     }
 
-    private func beat() async {
-        guard let credentials else { return }
-        do {
-            let reply = try await SessionAPI.post("heartbeat", credentials: credentials)
-            guard reply.stop else { return }
-            if reply.reason == "out-of-credits" { stop(.outOfCredit) } else { try await renewSession() }
-        } catch YoobError.unauthorized {
-            // The console ends sessions that missed beats (the app was in the background): open a new one.
-            try? await renewSession()
-        } catch {
-            // A missed beat is retried on the next one.
-        }
+    private func startHeartbeat() {
+        heartbeat?.stop()
+        let heartbeat = SessionHeartbeat(hooks: .init(
+            credentials: { [weak self] in self?.credentials },
+            renew: { [weak self] in try await self?.renewSession() },
+            grant: { [weak self] token, _ in self?.useGrant(token) },
+            ended: { [weak self] error in self?.sessionEnded(error) }))
+        self.heartbeat = heartbeat
+        heartbeat.start()
+    }
+
+    /// Beats now, for example when the app returns to the foreground. The session may have been ended while the app
+    /// was suspended; a new one is opened if so.
+    public func refreshSession() async {
+        await heartbeat?.beatNow()
     }
 
     private func renewSession() async throws {
-        guard case .cloud(_, let fetchCredentials) = source else { return }
-        credentials = try await fetchCredentials()
+        let fetchCredentials: @Sendable () async throws -> YoobCredentials
+        switch source {
+        case .local(_, let credentials), .cloud(_, let credentials): fetchCredentials = credentials
+        }
+        let next = try await fetchCredentials()
+        guard heartbeat != nil else { return }
+        credentials = next
+        access?.downloadToken = next.downloadToken
     }
 
-    private func stop(_ reason: YoobError) {
+    private func useGrant(_ token: String) {
+        credentials = credentials?.renewingGrant(token)
+        access?.downloadToken = token
+    }
+
+    private func sessionEnded(_ reason: YoobError) {
+        heartbeat = nil
         interrupt()
-        heartbeat?.cancel(); heartbeat = nil
+        microphone.stop()
+        player.shutdown()
+        engine = nil
+        isShowingSpeech = false
+        speechFrame = nil
+        if let credentials {
+            self.credentials = nil
+            Task { await SessionAPI.end(credentials) }
+        }
         phase = .stopped(reason)
-    }
-}
-
-enum SessionAPI {
-    struct Reply: Decodable {
-        let stop: Bool
-        let reason: String?
-        init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            stop = try c.decodeIfPresent(Bool.self, forKey: .stop) ?? false
-            reason = try c.decodeIfPresent(String.self, forKey: .reason)
-        }
-        enum CodingKeys: String, CodingKey { case stop, reason }
-    }
-
-    static func post(_ action: String, credentials: YoobCredentials) async throws -> Reply {
-        var request = URLRequest(url: credentials.apiBase.appendingPathComponent("api/v1/sessions/\(action)"))
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(credentials.sessionToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("yoob-ios/\(Yoob.version)", forHTTPHeaderField: "X-Yoob-SDK")
-        request.timeoutInterval = 15
-        let (data, response) = try await URLSession.shared.data(for: request)
-        switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
-        case 200:
-            if let reply = try? JSONDecoder().decode(Reply.self, from: data) { return reply }
-            return try JSONDecoder().decode(Reply.self, from: Data("{}".utf8))
-        case 401, 404: throw YoobError.unauthorized
-        case 402: throw YoobError.outOfCredit
-        case let status: throw YoobError.network("HTTP \(status)")
-        }
+        onSessionEnded?(reason)
     }
 }
