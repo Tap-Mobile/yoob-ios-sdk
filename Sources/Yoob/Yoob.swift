@@ -52,7 +52,7 @@ public struct YoobCredentials: Sendable, Decodable, Equatable {
     public let cdnBase: URL
 
     public init(sessionToken: String, downloadToken: String, heartbeatSeconds: Int = 30,
-                apiBase: URL = URL(string: "https://api.yoob.com")!, cdnBase: URL = URL(string: "https://cdn.yoob.com")!) {
+                apiBase: URL = URL(string: "https://api2.yoob.com")!, cdnBase: URL = URL(string: "https://cdn.yoob.com")!) {
         self.sessionToken = sessionToken; self.downloadToken = downloadToken
         self.heartbeatSeconds = max(5, heartbeatSeconds); self.apiBase = apiBase; self.cdnBase = cdnBase
     }
@@ -66,7 +66,7 @@ public struct YoobCredentials: Sendable, Decodable, Equatable {
         self.init(sessionToken: try c.decode(String.self, forKey: .sessionToken),
                   downloadToken: try c.decode(String.self, forKey: .downloadToken),
                   heartbeatSeconds: try c.decodeIfPresent(Int.self, forKey: .heartbeatSeconds) ?? 30,
-                  apiBase: try c.decodeIfPresent(URL.self, forKey: .apiBase) ?? URL(string: "https://api.yoob.com")!,
+                  apiBase: try c.decodeIfPresent(URL.self, forKey: .apiBase) ?? URL(string: "https://api2.yoob.com")!,
                   cdnBase: try c.decodeIfPresent(URL.self, forKey: .cdnBase) ?? URL(string: "https://cdn.yoob.com")!)
     }
 }

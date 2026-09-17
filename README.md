@@ -33,7 +33,7 @@ Create an API key in the [Yoob console](https://yoob.com/account/). Keep the key
 short-lived session instead:
 
 ```sh
-curl -X POST https://api.yoob.com/api/v1/avatar/sessions \
+curl -X POST https://api2.yoob.com/api/v1/avatar/sessions \
   -H "Authorization: Bearer $YOOB_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"characters": ["luna-realistic"]}'
@@ -169,8 +169,8 @@ This is everything the SDK sends to Yoob:
 | Call | When | Contents |
 |---|---|---|
 | Character files from `cdn.yoob.com` | First use and version updates | Your download grant |
-| `POST api.yoob.com/api/v1/sessions/heartbeat` | Every 15 s while prepared | Your session token |
-| `POST api.yoob.com/api/v1/sessions/end` | `close()` | Your session token |
+| `POST api2.yoob.com/api/v1/sessions/heartbeat` | Every 15 s while prepared | Your session token |
+| `POST api2.yoob.com/api/v1/sessions/end` | `close()` | Your session token |
 
 Heartbeats are how session time is metered. Call `await avatar.close()` when the character leaves the screen.
 
